@@ -301,6 +301,23 @@ div[data-testid="stSlider"] { padding-top: .15rem; }
   .table-summary { gap: .35rem; }
   .summary-tile { padding: .55rem .3rem; }
   div[data-testid="stHorizontalBlock"] { gap: .35rem; }
+  .st-key-action_dock div[data-testid="stHorizontalBlock"] {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: .35rem !important;
+  }
+  .st-key-replay_nav div[data-testid="stHorizontalBlock"] {
+    display: grid !important;
+    grid-template-columns: minmax(0, 1fr) 3.4rem minmax(0, 1fr) !important;
+    gap: .35rem !important;
+    align-items: center;
+  }
+  .st-key-action_dock div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+  .st-key-replay_nav div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+    width: 100% !important;
+    min-width: 0 !important;
+    flex: none !important;
+  }
 }
 
 @media (max-width: 380px) {
@@ -336,4 +353,3 @@ def apply_styles(st_module: Any | None = None) -> None:
 
 
 __all__ = ["MOBILE_CSS", "apply_styles"]
-

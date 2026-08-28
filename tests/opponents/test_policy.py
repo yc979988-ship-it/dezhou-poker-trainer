@@ -7,7 +7,7 @@ import random
 import pytest
 
 from poker_trainer.engine.hand import HoldemHand
-from poker_trainer.engine.models import ActionType, Position, Seat
+from poker_trainer.engine.models import ActionType, Position, Seat, Street
 from poker_trainer.opponents.policy import OpponentPolicy, PolicyContext
 from poker_trainer.opponents.profiles import OpponentProfile, generate_base_profile
 
@@ -137,13 +137,79 @@ def test_medium_suited_hand_can_flat_three_bb_but_folds_to_larger_open(
         context = PolicyContext.from_hand(hand, "HJ")
         decision = OpponentPolicy.choose(
             context,
-            profile("HJ", vpip=0.37, pfr=0.24, fold_tendency=0.48),
+            profile("HJ", vpip=0.50, pfr=0.16, fold_tendency=0.48),
             policy_seed=0,
         )
         return decision.action
 
     assert decide(120) == ActionType.CALL
+    assert decide(140) == ActionType.CALL
     assert decide(240) == ActionType.FOLD
+
+
+def test_seeded_population_produces_multiway_limp_calls_without_calling_everything(
+    six_seats,
+) -> None:
+    def sample() -> tuple[int, int, int, int, int]:
+        profiles = {
+            position.value: generate_base_profile(position.value, master_seed=777)
+            for position in (
+                Position.UTG,
+                Position.HJ,
+                Position.CO,
+                Position.BTN,
+                Position.SB,
+                Position.BB,
+            )
+        }
+        multiway_hands = cold_calls = cold_call_spots = 0
+        limp_calls = limp_call_spots = 0
+        for hand_seed in range(320):
+            hand = HoldemHand(
+                six_seats(),
+                seed=hand_seed,
+                hand_id=f"friend-game-calibration-{hand_seed}",
+            )
+            voluntary_players: set[str] = set()
+            while hand.street == Street.PREFLOP and not hand.is_complete:
+                player_id = hand.current_actor_id
+                assert player_id is not None
+                context = PolicyContext.from_hand(hand, player_id)
+                decision = OpponentPolicy.choose(
+                    context,
+                    profiles[player_id],
+                    policy_seed=f"friend-game-policy-{hand_seed}",
+                )
+                if decision.action in (
+                    ActionType.CALL,
+                    ActionType.RAISE,
+                    ActionType.ALL_IN,
+                ):
+                    voluntary_players.add(player_id)
+                if context.preflop_raise_count > 0 and context.legal.can_call:
+                    if context.limped_before_raise:
+                        limp_call_spots += 1
+                        limp_calls += decision.action == ActionType.CALL
+                    else:
+                        cold_call_spots += 1
+                        cold_calls += decision.action == ActionType.CALL
+                hand.act(player_id, decision.action, decision.amount)
+            multiway_hands += len(voluntary_players) >= 3
+        return (
+            multiway_hands,
+            cold_calls,
+            cold_call_spots,
+            limp_calls,
+            limp_call_spots,
+        )
+
+    first = sample()
+    assert sample() == first
+    multiway_hands, cold_calls, cold_call_spots, limp_calls, limp_call_spots = first
+
+    assert 220 <= multiway_hands <= 290
+    assert 0.22 <= cold_calls / cold_call_spots <= 0.42
+    assert 0.45 <= limp_calls / limp_call_spots <= 0.75
 
 
 def test_limper_mixes_call_and_fold_against_three_bb_raise(six_seats) -> None:
@@ -271,4 +337,3 @@ def test_forced_mistakes_are_still_legal(six_seats) -> None:
             assert context.min_raise_to <= decision.amount <= context.max_to
         else:
             assert decision.amount is None
-

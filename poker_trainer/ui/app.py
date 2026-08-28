@@ -545,6 +545,29 @@ def normalize_reviews(value: Any) -> tuple[Any, ...]:
     return (value,)
 
 
+def replay_reviews_through_sequence(
+    reviews: Iterable[Any],
+    active_sequence: int | None,
+) -> tuple[Any, ...]:
+    """返回回放当前步已经发生的评价，并严格按 ``review.sequence`` 排序。"""
+
+    if active_sequence is None:
+        return ()
+    reached: list[tuple[int, Any]] = []
+    for review in reviews:
+        raw_sequence = _read(review, "sequence")
+        if raw_sequence is None:
+            continue
+        try:
+            sequence = int(raw_sequence)
+        except (TypeError, ValueError):
+            continue
+        if sequence <= active_sequence:
+            reached.append((sequence, review))
+    reached.sort(key=lambda item: item[0])
+    return tuple(review for _, review in reached)
+
+
 _RATING_SEVERITY = {
     "推荐": 0,
     "可以接受": 1,
@@ -582,7 +605,10 @@ def review_cards_html(
 
     parts = [f'<div class="review-overview">{escape(overview)}</div>', '<div class="review-list">']
     for review in normalized:
-        sequence = int(_read(review, "sequence", -1) or -1)
+        try:
+            sequence = int(_read(review, "sequence", -1))
+        except (TypeError, ValueError):
+            sequence = -1
         street_raw = _read(review, "street", "")
         try:
             street_name = Street(_value(street_raw)).label_zh
@@ -595,6 +621,7 @@ def review_cards_html(
             action_name = str(_value(action_raw))
         history_row = action_by_sequence.get(sequence)
         if history_row is not None:
+            street_name = str(history_row.get("街道", street_name))
             action_name = str(history_row.get("简述", action_name))
 
         rating = str(_value(_read(review, "rating", _read(review, "grade", ""))))
@@ -708,7 +735,27 @@ def load_saved_reviews(
 
     with SQLiteStore(db_path) as store:
         rows = store.load_decision_reviews(hand_id)
-    return [dict(row.get("review", row)) for row in rows]
+    reviews: list[dict[str, Any]] = []
+    fallback_fields = (
+        "player_id",
+        "rating",
+        "reason",
+        "recommended_action",
+        "pot_odds",
+        "equity",
+        "outs",
+        "hit_probability",
+    )
+    for row in rows:
+        payload = dict(row.get("review") or {})
+        # decision_reviews.action_sequence 是关联 actions.sequence 的权威字段；
+        # 兼容旧 review_json 未保存 sequence 或内部值不一致的记录。
+        payload["sequence"] = int(row["action_sequence"])
+        for field in fallback_fields:
+            if payload.get(field) is None and row.get(field) is not None:
+                payload[field] = row[field]
+        reviews.append(payload)
+    return reviews
 
 
 def _get_streamlit() -> Any:
@@ -823,12 +870,13 @@ def _summary_tiles_html(view: Mapping[str, Any], hero_stack: int) -> str:
     )
 
 
-def _seat_grid_html(view: Mapping[str, Any]) -> str:
-    current_street = str(view["street_name"])
+def seat_grid_html(view: Mapping[str, Any]) -> str:
+    """生成座位卡，并保留每位玩家最近一次自愿动作及金额。"""
+
     latest_by_player = {
         str(row["玩家"]): row
         for row in view.get("history", ())
-        if str(row.get("街道", "")) == current_street and not bool(row.get("强制", False))
+        if not bool(row.get("强制", False))
     }
     cells: list[str] = []
     for seat in view["seats"]:
@@ -840,14 +888,17 @@ def _seat_grid_html(view: Mapping[str, Any]) -> str:
         if seat["player_id"] == view["current_actor_id"]:
             classes.append("acting")
         recent = latest_by_player.get(str(seat["player_id"]))
-        if seat["folded"]:
-            state = "已弃牌"
-        elif seat["all_in"]:
-            state = "已全下"
+        if not seat["player_id"]:
+            state = ""
         elif seat["player_id"] == view["current_actor_id"]:
             state = "轮到你" if seat["is_hero"] else "正在行动"
         elif recent is not None:
-            state = str(recent["简述"])
+            actor = "你" if seat["is_hero"] else str(_value(seat["position"]))
+            state = f'{actor}｜{recent["简述"]}'
+        elif seat["folded"]:
+            state = "已弃牌"
+        elif seat["all_in"]:
+            state = "已全下"
         else:
             state = ""
         cards = cards_html(
@@ -931,8 +982,8 @@ def _render_action_dock(st: Any, trainer: Any, hand: Any) -> None:
                 f"合法范围 {format_chips(sizing.minimum)} — {format_chips(sizing.maximum)}"
             )
 
-        for start in range(0, len(controls), 3):
-            chunk = controls[start : start + 3]
+        for start in range(0, len(controls), 2):
+            chunk = controls[start : start + 2]
             columns = st.columns(len(chunk))
             for column, control in zip(columns, chunk, strict=True):
                 with column:
@@ -1044,7 +1095,7 @@ def _render_training(st: Any) -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(_seat_grid_html(view), unsafe_allow_html=True)
+    st.markdown(seat_grid_html(view), unsafe_allow_html=True)
 
     voluntary_rows = [row for row in view["history"] if not row["强制"]]
     display_street = view["street_name"]
@@ -1061,12 +1112,14 @@ def _render_training(st: Any) -> None:
             action_timeline_html(current_street_rows, hero_id=hero_id, limit=6),
             unsafe_allow_html=True,
         )
-    else:
+    elif display_street == Street.PREFLOP.label_zh:
         forced_rows = [row for row in view["history"] if row["强制"]]
         st.markdown(
             action_timeline_html(forced_rows, hero_id=hero_id, limit=2),
             unsafe_allow_html=True,
         )
+    else:
+        st.markdown(action_timeline_html((), hero_id=hero_id), unsafe_allow_html=True)
     if len(view["history"]) > len(current_street_rows):
         with st.expander(f"完整行动（{len(view['history'])}）", expanded=False):
             st.markdown(
@@ -1185,27 +1238,35 @@ def _render_replay(st: Any) -> None:
     step_key = f"replay_step_{selected_id}"
     current_step = max(0, min(max_steps, int(st.session_state.get(step_key, max_steps))))
     st.session_state[step_key] = current_step
-    previous_column, counter_column, next_column = st.columns([1, 0.65, 1])
-    with previous_column:
-        if st.button(
-            "← 上一步",
-            key=f"replay_prev_{selected_id}",
-            width="stretch",
-            disabled=current_step <= 0,
-        ):
-            st.session_state[step_key] = current_step - 1
-            _rerun(st)
-    with counter_column:
-        st.markdown(f'<div class="replay-counter">{current_step}/{max_steps}</div>', unsafe_allow_html=True)
-    with next_column:
-        if st.button(
-            "下一步 →",
-            key=f"replay_next_{selected_id}",
-            width="stretch",
-            disabled=current_step >= max_steps,
-        ):
-            st.session_state[step_key] = current_step + 1
-            _rerun(st)
+    try:
+        replay_navigation = st.container(key="replay_nav")
+    except TypeError:  # Streamlit 旧版不支持 container key
+        replay_navigation = st.container()
+    with replay_navigation:
+        previous_column, counter_column, next_column = st.columns([1, 0.65, 1])
+        with previous_column:
+            if st.button(
+                "← 上一步",
+                key=f"replay_prev_{selected_id}",
+                width="stretch",
+                disabled=current_step <= 0,
+            ):
+                st.session_state[step_key] = current_step - 1
+                _rerun(st)
+        with counter_column:
+            st.markdown(
+                f'<div class="replay-counter">{current_step}/{max_steps}</div>',
+                unsafe_allow_html=True,
+            )
+        with next_column:
+            if st.button(
+                "下一步 →",
+                key=f"replay_next_{selected_id}",
+                width="stretch",
+                disabled=current_step >= max_steps,
+            ):
+                st.session_state[step_key] = current_step + 1
+                _rerun(st)
     with st.expander("精确跳转", expanded=False):
         step = st.slider(
             "动作步数",
@@ -1230,9 +1291,9 @@ def _render_replay(st: Any) -> None:
         step_summary = "开局：小盲和大盲已入池"
     else:
         actor = "你" if active_row["玩家"] == hero_id else active_row["位置简称"]
-        step_summary = f'{active_row["街道"]} · {actor}{active_row["简述"]}'
+        step_summary = f'{active_row["街道"]} · {actor}｜{active_row["简述"]}'
     st.markdown(
-        f'<div class="replay-now"><span>本步</span>{escape(step_summary)}</div>',
+        f'<div class="replay-now"><span>当前动作</span>{escape(step_summary)}</div>',
         unsafe_allow_html=True,
     )
     st.caption(f"确定性重建 · seed {bundle.seed}")
@@ -1246,8 +1307,8 @@ def _render_replay(st: Any) -> None:
         "</div>",
         unsafe_allow_html=True,
     )
-    st.markdown(_seat_grid_html(view), unsafe_allow_html=True)
-    st.markdown("#### 整手行动")
+    st.markdown(seat_grid_html(view), unsafe_allow_html=True)
+    st.markdown("#### 按街行动历史")
     st.markdown(
         action_timeline_html(
             view["history"],
@@ -1276,11 +1337,7 @@ def _render_replay(st: Any) -> None:
                 if rank_rows:
                     st.dataframe(rank_rows, width="stretch", hide_index=True)
 
-    reached_reviews = [
-        review
-        for review in saved_reviews
-        if active_sequence is not None and int(_read(review, "sequence", -1) or -1) <= active_sequence
-    ]
+    reached_reviews = replay_reviews_through_sequence(saved_reviews, active_sequence)
     if reached_reviews:
         _render_reviews(
             st,
@@ -1361,10 +1418,11 @@ __all__ = [
     "main",
     "metric_detail_rows",
     "normalize_reviews",
+    "replay_reviews_through_sequence",
     "rebuild_replay",
     "review_cards_html",
     "result_pot_rows",
     "showdown_rank_rows",
+    "seat_grid_html",
     "statistics_table_rows",
 ]
-

@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from poker_trainer.opponents.profiles import OpponentProfile
 
 
-POLICY_VERSION = "opponent-policy-v2"
+POLICY_VERSION = "opponent-policy-v3"
 _MONTE_CARLO_TRIALS = 56
 
 
@@ -348,10 +348,12 @@ def _choose_preflop(
         )
 
     play_threshold = 0.73 - 0.68 * profile.vpip
-    raise_threshold = 0.78 - 0.65 * profile.pfr
+    raise_threshold = 0.82 - 0.72 * profile.pfr
     if context.limper_count:
-        play_threshold -= min(0.06, context.limper_count * 0.02)
-        raise_threshold += min(0.04, context.limper_count * 0.01)
+        # 朋友局有人入池后会扩宽 over-limp，同时明显减少边缘牌隔离。
+        # 优质牌仍由 premium 分支直接加注。
+        play_threshold -= min(0.09, context.limper_count * 0.025)
+        raise_threshold += min(0.14, context.limper_count * 0.035)
 
     premium = strength >= 0.90
     wants_raise = premium or selection_score >= raise_threshold
@@ -404,25 +406,27 @@ def _choose_facing_preflop_raise(
     if premium and context.legal.can_all_in:
         return BotDecision(ActionType.ALL_IN, reason="强牌短码全下", estimated_equity=strength)
 
-    # 3bb 是朋友局的普通开池尺度，应比 4bb 及以上更容易获得跟注；
-    # 已经 limp 的玩家面对首次小加注也会以混合频率补齐，但面对 3bet
-    # 不继承该优惠。已有冷跟者时再给少量多人池倾向。
+    # 3–3.5bb 是朋友局的普通尺度；6bb 以上快速收紧。底池赔率另外
+    # 反映已有 limp/cold-call 对价格的改善，避免只按人头无脑跟。
     open_size_bb = context.current_bet / context.big_blind
-    sizing_pressure = max(-0.04, min(0.16, (open_size_bb - 4.0) * 0.04))
+    sizing_pressure = max(-0.035, min(0.18, (open_size_bb - 3.5) * 0.035))
+    pot_odds_pressure = max(
+        -0.045,
+        min(0.055, (context.pot_odds - 0.34) * 0.45),
+    )
     limp_call_discount = (
-        0.075
+        0.11
         if context.limped_before_raise and context.preflop_raise_count == 1
         else 0.0
     )
-    cold_call_discount = min(0.06, context.cold_caller_count * 0.02)
     continue_threshold = (
-        0.76
-        - 0.50 * profile.vpip
-        + 0.12 * profile.fold_tendency
-        + max(0, context.preflop_raise_count - 1) * 0.09
+        0.75
+        - 0.52 * profile.vpip
+        + 0.13 * profile.fold_tendency
+        + max(0, context.preflop_raise_count - 1) * 0.10
         + sizing_pressure
+        + pot_odds_pressure
         - limp_call_discount
-        - cold_call_discount
     )
     continue_noise = (_uniform(policy_seed, context, "preflop-continue") - 0.5) * 0.09
     if context.legal.can_call and selection_score + continue_noise >= continue_threshold:
@@ -702,4 +706,3 @@ def _fallback(
 
 
 __all__ = ["BotDecision", "OpponentPolicy", "POLICY_VERSION", "PolicyContext"]
-

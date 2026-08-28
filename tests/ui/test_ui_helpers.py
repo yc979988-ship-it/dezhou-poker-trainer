@@ -36,8 +36,10 @@ from poker_trainer.ui.app import (
     metric_detail_rows,
     normalize_reviews,
     rebuild_replay,
+    replay_reviews_through_sequence,
     review_cards_html,
     result_pot_rows,
+    seat_grid_html,
     showdown_rank_rows,
     statistics_table_rows,
 )
@@ -249,6 +251,46 @@ def test_action_timeline_is_grouped_compact_and_highlights_hero() -> None:
     assert "action-bet latest" in html
 
 
+def test_seat_cards_keep_latest_action_amount_and_highlight_hero() -> None:
+    view = {
+        "current_actor_id": None,
+        "history": [
+            {"玩家": "hero", "简述": "跟注 120", "强制": False},
+            {"玩家": "villain", "简述": "加注到 350", "强制": False},
+        ],
+        "seats": [
+            {
+                "player_id": "hero",
+                "position": Position.UTG,
+                "position_name": "UTG（前位）",
+                "name": "英雄",
+                "stack": 3_880,
+                "folded": False,
+                "all_in": False,
+                "is_hero": True,
+                "cards": ("As", "Kh"),
+                "cards_hidden": False,
+            },
+            {
+                "player_id": "villain",
+                "position": Position.HJ,
+                "position_name": "HJ（中位）",
+                "name": "对手1",
+                "stack": 3_650,
+                "folded": True,
+                "all_in": False,
+                "is_hero": False,
+                "cards": (),
+                "cards_hidden": True,
+            },
+        ],
+    }
+    html = seat_grid_html(view)
+    assert 'class="seat-card hero"' in html
+    assert "你｜跟注 120" in html
+    assert "HJ｜加注到 350" in html
+
+
 def test_statistics_table_always_has_six_positions_and_all_13_metrics() -> None:
     empty = aggregate_by_position([])
     rows = statistics_table_rows(empty)
@@ -279,6 +321,18 @@ def test_review_return_shapes_are_normalized_without_losing_order() -> None:
     assert normalize_reviews(None) == ()
     assert normalize_reviews(first) == (first,)
     assert normalize_reviews([first, second]) == (first, second)
+
+
+def test_replay_reviews_use_review_sequence_not_list_position() -> None:
+    reviews = [
+        {"sequence": 11, "reason": "later"},
+        {"sequence": 4, "reason": "first"},
+        {"sequence": "7", "reason": "current"},
+        {"sequence": "bad", "reason": "invalid"},
+    ]
+    reached = replay_reviews_through_sequence(reviews, 7)
+    assert [review["reason"] for review in reached] == ["first", "current"]
+    assert replay_reviews_through_sequence(reviews, None) == ()
 
 
 def test_review_cards_link_exact_action_sequence_and_show_equity_gap() -> None:
@@ -346,7 +400,6 @@ def test_sqlite_replay_helpers_list_and_load_bundle(tmp_path, six_seats) -> None
             hand.hand_id,
             hero_record.sequence,
             {
-                "sequence": hero_record.sequence,
                 "player_id": "UTG",
                 "street": hero_record.street.value,
                 "action": hero_record.action.value,
@@ -376,6 +429,7 @@ def test_mobile_css_has_touch_target_and_phone_breakpoint() -> None:
     assert 'button[kind="secondary"]' in MOBILE_CSS
     assert "background: #fff" in MOBILE_CSS
     assert ".st-key-action_dock" in MOBILE_CSS
+    assert ".st-key-replay_nav" in MOBILE_CSS
+    assert "grid-template-columns: repeat(2" in MOBILE_CSS
     assert 'header[data-testid="stHeader"]' in MOBILE_CSS
     assert "display: none !important" in MOBILE_CSS
-

@@ -27,24 +27,25 @@ def test_base_profiles_have_realistic_ranges_and_pfr_below_vpip() -> None:
     for master_seed in range(100):
         profile = generate_base_profile(f"villain-{master_seed % 5}", master_seed)
 
-        assert 0.21 <= profile.vpip <= 0.53
-        assert 0.45 <= profile.pfr / profile.vpip <= 0.88
-        assert 0.025 <= profile.three_bet <= 0.14
+        assert 0.34 <= profile.vpip <= 0.70
+        assert 0.14 <= profile.pfr / profile.vpip <= 0.42
+        assert 0.02 <= profile.three_bet <= 0.12
         assert 0.80 <= profile.aggression_factor <= 4.00
         assert 0.26 <= profile.fold_tendency <= 0.70
-        assert 0.05 <= profile.limp_tendency <= 0.31
-        assert 0.01 <= profile.mistake_rate <= 0.10
+        assert 0.28 <= profile.limp_tendency <= 0.72
+        assert 0.01 <= profile.mistake_rate <= 0.07
         assert 0.0 <= profile.pfr < profile.vpip <= 1.0
 
 
-def test_population_is_calibrated_as_slightly_loose_friend_game() -> None:
+def test_population_is_calibrated_as_loose_passive_friend_game() -> None:
     profiles = [
         generate_base_profile(f"villain-{seed}", seed)
         for seed in range(400)
     ]
 
-    assert 0.35 <= mean(profile.vpip for profile in profiles) <= 0.39
-    assert 0.16 <= mean(profile.limp_tendency for profile in profiles) <= 0.20
+    assert 0.50 <= mean(profile.vpip for profile in profiles) <= 0.54
+    assert 0.13 <= mean(profile.pfr for profile in profiles) <= 0.16
+    assert 0.47 <= mean(profile.limp_tendency for profile in profiles) <= 0.51
     assert 0.46 <= mean(profile.fold_tendency for profile in profiles) <= 0.50
 
 
@@ -153,4 +154,3 @@ def test_profile_rejects_invalid_values(
 def test_seed_type_must_be_stably_encodable(bad_seed: object) -> None:
     with pytest.raises(TypeError, match="seed"):
         generate_base_profile("opponent-1", bad_seed)  # type: ignore[arg-type]
-

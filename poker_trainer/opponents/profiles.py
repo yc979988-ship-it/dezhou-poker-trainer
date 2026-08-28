@@ -14,16 +14,16 @@ import math
 
 Seed = int | str | bytes
 
-# 基础画像按“整体略松的普通朋友局”校准，同时保留明显的个体差异。
-# 主要增加主动入池与 limp；PFR 占比、3bet 和激进度不额外上调，避免
-# 把“松一点”误调成全员松凶。
-_VPIP_RANGE = (0.21, 0.53)
-_PFR_SHARE_RANGE = (0.45, 0.88)
-_THREE_BET_RANGE = (0.025, 0.14)
+# 根据 20/40 朋友局录像校准为“松而偏被动”的群体：常出现 3–5 人
+# limp，但保留紧手与松手的明显个体差异。PFR 以 VPIP 的较低占比
+# 生成，避免提高入池率后把全桌同时调成松凶。
+_VPIP_RANGE = (0.34, 0.70)
+_PFR_SHARE_RANGE = (0.14, 0.42)
+_THREE_BET_RANGE = (0.02, 0.12)
 _AGGRESSION_FACTOR_RANGE = (0.80, 4.00)
 _FOLD_TENDENCY_RANGE = (0.26, 0.70)
-_LIMP_TENDENCY_RANGE = (0.05, 0.31)
-_MISTAKE_RATE_RANGE = (0.01, 0.10)
+_LIMP_TENDENCY_RANGE = (0.28, 0.72)
+_MISTAKE_RATE_RANGE = (0.01, 0.07)
 
 # 对有界变量归一化后，在 logit 空间内允许的最大单场移动。
 _SESSION_LOGIT_SHIFT = 0.24
@@ -262,4 +262,3 @@ __all__ = [
     "drift_for_session",
     "generate_base_profile",
 ]
-
