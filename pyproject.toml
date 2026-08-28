@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poker-adaptive-trainer"
+version = "0.1.0"
+description = "离线、可回放的德州扑克自适应训练器 MVP"
+requires-python = ">=3.11"
+dependencies = [
+  "streamlit>=1.62,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+include = ["poker_trainer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
