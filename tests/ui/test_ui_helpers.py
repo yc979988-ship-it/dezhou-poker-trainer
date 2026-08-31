@@ -199,6 +199,9 @@ def test_history_rows_are_chinese_and_include_forced_blinds(six_seats) -> None:
     assert rows[0]["简述"] == "下小盲 20"
     assert rows[0]["强制"] is True
     assert rows[1]["底池后"] == 60
+    assert rows[1]["底池前"] == 20
+    assert rows[1]["投入"] == 40
+    assert rows[1]["需跟"] == 0
 
 
 def test_action_rows_use_compact_amount_words_and_positive_refund() -> None:
@@ -347,19 +350,85 @@ def test_review_cards_link_exact_action_sequence_and_show_equity_gap() -> None:
             "equity": 0.18,
             "outs": 4,
             "hit_probability": 0.16,
+            "draw_names": ["卡顺听牌"],
+            "equity_basis": "random_unknown_hands",
+            "recommended_action": "fold",
+            "detail_lines": ["多人底池应收紧继续范围。"],
         }
     ]
     history = [
         {"#": 6, "简述": "过牌"},
-        {"#": 7, "简述": "跟注 320"},
+        {
+            "#": 7,
+            "简述": "跟注 300",
+            "动作代码": "call",
+            "投入": 300,
+            "需跟": 300,
+            "底池前": 700,
+        },
     ]
     html = review_cards_html(reviews, history=history)
-    assert "翻牌 · 你跟注 320" in html
+    assert "翻牌 · 你跟注 300" in html
     assert "明显错误" in html and "grade-error" in html
     assert "所需胜率 30.0%" in html
-    assert "估算权益 18.0%" in html
-    assert "权益差 -12.0pct" in html
-    assert "查看判断依据" in html
+    assert "随机未知手牌基准权益 18.0%" in html
+    assert "基准权益差 -12.0pct" in html
+    assert "常见听牌 4 outs" in html
+    assert "听牌类型 卡顺听牌" in html
+    assert "到河牌命中 16.0%" in html
+    assert "推荐替代：弃牌" in html
+    assert "300 ÷（700 + 300）= 30.0%" in html
+    assert "不是对手动作加权后的真实范围" in html
+    assert "多人底池应收紧继续范围。" in html
+    assert "展开完整分析" in html
+
+
+def test_review_cards_do_not_invent_missing_math_or_alternative() -> None:
+    html = review_cards_html(
+        [
+            {
+                "sequence": 2,
+                "street": "preflop",
+                "action": "check",
+                "rating": "推荐",
+                "reason": "大盲可免费看牌。",
+            }
+        ]
+    )
+
+    assert "大盲可免费看牌。" in html
+    assert "所需胜率" not in html
+    assert "基准权益" not in html
+    assert "outs" not in html
+    assert "推荐替代" not in html
+
+
+def test_review_cards_use_contestable_pot_formula_when_side_pot_is_not_known() -> None:
+    html = review_cards_html(
+        [
+            {
+                "sequence": 9,
+                "street": "turn",
+                "action": "call",
+                "rating": "可以接受",
+                "reason": "权益接近底池赔率。",
+                "pot_odds": 0.25,
+            }
+        ],
+        history=[
+            {
+                "#": 9,
+                "简述": "跟注 100",
+                "动作代码": "call",
+                "投入": 100,
+                "需跟": 100,
+                "底池前": 900,
+            }
+        ],
+    )
+
+    assert "跟注额 ÷（可争夺底池 + 跟注额）= 25.0%" in html
+    assert "100 ÷（900 + 100）" not in html
 
 
 def test_hero_net_result_uses_ending_stack_minus_initial_stack(six_seats) -> None:
@@ -425,6 +494,9 @@ def test_mobile_css_has_touch_target_and_phone_breakpoint() -> None:
     assert ".seat-grid" in MOBILE_CSS
     assert ".action-feed" in MOBILE_CSS
     assert ".review-overview" in MOBILE_CSS
+    assert ".review-metrics" in MOBILE_CSS
+    assert ".review-alternative" in MOBILE_CSS
+    assert ".review-formula" in MOBILE_CSS
     assert ".replay-now" in MOBILE_CSS
     assert 'button[kind="secondary"]' in MOBILE_CSS
     assert "background: #fff" in MOBILE_CSS

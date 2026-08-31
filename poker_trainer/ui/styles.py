@@ -229,7 +229,25 @@ div[data-testid="stFormSubmitButton"] > button[kind="secondary"]:hover {
   background: #e8f3ed;
 }
 .feedback-card .reason { margin-top: .3rem; line-height: 1.48; }
-.feedback-card .numbers { margin-top: .35rem; color: var(--muted); font-size: .78rem; }
+.review-metrics { display: flex; flex-wrap: wrap; gap: .26rem; margin-top: .42rem; }
+.review-metric {
+  border-radius: 999px;
+  padding: .16rem .42rem;
+  background: #f1f5f3;
+  color: #355448;
+  font-size: .7rem;
+  font-weight: 750;
+  line-height: 1.25;
+}
+.review-alternative {
+  margin-top: .42rem;
+  border-radius: 8px;
+  background: #edf7f2;
+  color: var(--felt-dark);
+  padding: .38rem .48rem;
+  font-size: .77rem;
+  font-weight: 800;
+}
 .feedback-card.grade-acceptable { border-left-color: #3976b8; }
 .feedback-card.grade-acceptable .rating { color: #21598f; background: #e9f2fb; }
 .feedback-card.grade-marginal { border-left-color: #d58a18; }
@@ -244,9 +262,13 @@ div[data-testid="stFormSubmitButton"] > button[kind="secondary"]:hover {
   font-size: .78rem;
   font-weight: 800;
 }
-.review-evidence { margin-top: .42rem; color: var(--muted); font-size: .75rem; }
+.review-evidence { margin-top: .42rem; color: var(--muted); font-size: .74rem; }
 .review-evidence summary { cursor: pointer; font-weight: 750; }
-.review-evidence div { padding-top: .28rem; }
+.review-evidence > div { padding-top: .3rem; line-height: 1.42; }
+.review-formula { color: #264c3e; font-variant-numeric: tabular-nums; }
+.review-equity-note { color: var(--muted); }
+.review-detail-lines { margin: .3rem 0 0; padding-left: 1.15rem; }
+.review-detail-lines li { margin: .16rem 0; line-height: 1.42; }
 
 .replay-counter {
   display: flex;
@@ -298,6 +320,10 @@ div[data-testid="stSlider"] { padding-top: .15rem; }
   .seat-grid { gap: .42rem; }
   .seat-card { padding: .52rem; }
   .seat-card .position { font-size: .76rem; }
+  .feedback-card { padding: .58rem .62rem; border-radius: 12px; }
+  .feedback-card .reason { font-size: .82rem; }
+  .review-metrics { gap: .22rem; }
+  .review-metric { padding: .14rem .36rem; font-size: .67rem; }
   .table-summary { gap: .35rem; }
   .summary-tile { padding: .55rem .3rem; }
   div[data-testid="stHorizontalBlock"] { gap: .35rem; }

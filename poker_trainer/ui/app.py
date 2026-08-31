@@ -262,7 +262,12 @@ def action_history_rows(history: Iterable[Any]) -> list[dict[str, Any]]:
                 "动作代码": action.value,
                 "简述": summary,
                 "筹码": detail,
+                # 复盘公式使用动作发生前的公开状态。保留原始数值，不在
+                # 展示层反推边池或对手范围。
+                "投入": paid,
+                "底池前": int(_read(record, "pot_before", 0) or 0),
                 "底池后": int(_read(record, "pot_after", 0) or 0),
+                "需跟": int(_read(record, "to_call_before", 0) or 0),
                 "强制": forced,
             }
         )
@@ -583,6 +588,132 @@ _RATING_CSS = {
 }
 
 
+def _ratio(value: Any) -> float | None:
+    """安全读取 0..1 比例；无效数据不进入复盘，避免展示伪造数字。"""
+
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0.0 <= number <= 1.0:
+        return None
+    return number
+
+
+def _optional_int(source: Any, *keys: str) -> int | None:
+    """读取第一个明确提供的非负整数，不从评价文字猜测尺度。"""
+
+    for key in keys:
+        value = _read(source, key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number >= 0:
+            return number
+    return None
+
+
+def _recommended_action_text(review: Any) -> str:
+    """仅展示教练明确给出的替代动作/尺度，不自行补造建议。"""
+
+    raw_action = _read(review, "recommended_action")
+    amount = _optional_int(
+        review,
+        "recommended_bet_to",
+        "recommended_amount",
+        "reference_bet_to",
+    )
+    detail = _read(review, "recommended_detail", _read(review, "alternative"))
+    action_name = ""
+    if raw_action not in {None, ""}:
+        try:
+            action_name = ACTION_LABELS[ActionType(_value(raw_action))]
+        except (TypeError, ValueError, KeyError):
+            action_name = str(_value(raw_action)).strip()
+    if action_name and amount is not None:
+        connector = "到" if action_name in {"下注", "加注"} else " "
+        return f"推荐替代：{action_name}{connector}{amount:,}"
+    if action_name:
+        return f"推荐替代：{action_name}"
+    if amount is not None:
+        return f"参考尺度：{amount:,}"
+    if detail not in {None, ""}:
+        return f"推荐替代：{str(detail).strip()}"
+    return ""
+
+
+def _detail_lines(review: Any) -> tuple[str, ...]:
+    """兼容教练按行给出的补充说明，并过滤空行。"""
+
+    value = _read(review, "detail_lines")
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values: Iterable[Any] = (value,)
+    elif isinstance(value, Iterable) and not isinstance(value, Mapping):
+        values = value
+    else:
+        return ()
+    return tuple(text for item in values if (text := str(item).strip()))
+
+
+def _text_items(source: Any, key: str) -> tuple[str, ...]:
+    """读取供展示的字符串序列；单个字符串不会被拆成字符。"""
+
+    value = _read(source, key)
+    if value is None:
+        return ()
+    values: Iterable[Any]
+    if isinstance(value, str):
+        values = (value,)
+    elif isinstance(value, Iterable) and not isinstance(value, Mapping):
+        values = value
+    else:
+        return ()
+    return tuple(text for item in values if (text := str(item).strip()))
+
+
+def _equity_basis_label(review: Any) -> str:
+    """把教练提供的权益口径转为中文；缺省沿用当前模型的真实口径。"""
+
+    raw = str(_read(review, "equity_basis", "")).strip()
+    aliases = {
+        "random_unknown_hands": "随机未知手牌",
+        "uniform_random_unknown_hands": "随机未知手牌",
+        "uniform_random": "随机未知手牌",
+    }
+    return aliases.get(raw, raw) or "随机未知手牌"
+
+
+def _pot_odds_formula(pot_odds: float, history_row: Mapping[str, Any] | None) -> str:
+    """生成可核验的底池赔率公式；边池不匹配时明确使用可争夺底池。"""
+
+    result = f"{pot_odds * 100:.1f}%"
+    if history_row is None:
+        return f"跟注额 ÷（可争夺底池 + 跟注额）= {result}"
+
+    action_code = str(history_row.get("动作代码", ""))
+    pot_before = _optional_int(history_row, "底池前")
+    to_call = _optional_int(history_row, "需跟")
+    paid = _optional_int(history_row, "投入")
+    call_amount = paid if action_code == ActionType.CALL.value and paid else to_call
+    if pot_before is not None and call_amount and pot_before + call_amount > 0:
+        simple_odds = call_amount / (pot_before + call_amount)
+        # 普通底池可展示筹码代入；多人全下时总底池可能包含英雄无权
+        # 争夺的边池，此时不能拿总底池冒充可争夺底池。
+        if abs(simple_odds - pot_odds) <= 0.005:
+            return (
+                f"{call_amount:,} ÷（{pot_before:,} + {call_amount:,}）"
+                f"= {result}"
+            )
+    return f"跟注额 ÷（可争夺底池 + 跟注额）= {result}"
+
+
 def review_cards_html(
     reviews: Sequence[Any],
     *,
@@ -627,28 +758,73 @@ def review_cards_html(
         rating = str(_value(_read(review, "rating", _read(review, "grade", ""))))
         reason = str(_read(review, "reason", ""))
         grade_class = _RATING_CSS.get(rating, "acceptable")
-        pot_odds = _read(review, "pot_odds")
-        equity = _read(review, "equity")
-        outs = _read(review, "outs")
-        hit_probability = _read(review, "hit_probability")
-        numbers: list[str] = []
-        if pot_odds is not None:
-            numbers.append(f"所需胜率 {float(pot_odds) * 100:.1f}%")
+        pot_odds = _ratio(_read(review, "pot_odds"))
+        equity = _ratio(_read(review, "equity"))
+        hit_probability = _ratio(_read(review, "hit_probability"))
+        outs = _optional_int(review, "outs")
+        draw_names = _text_items(review, "draw_names")
+        equity_basis = _equity_basis_label(review)
+
+        metrics: list[str] = []
+        # 0% 表示本次没有面对跟注价格，不冒充一项有意义的“所需胜率”。
+        if pot_odds is not None and pot_odds > 0:
+            metrics.append(f"所需胜率 {pot_odds * 100:.1f}%")
         if equity is not None:
-            numbers.append(f"估算权益 {float(equity) * 100:.1f}%")
-        if pot_odds is not None and equity is not None:
-            edge = (float(equity) - float(pot_odds)) * 100
-            numbers.append(f"权益差 {edge:+.1f}pct")
-        if outs is not None:
-            numbers.append(f"{int(outs)} outs")
-        if hit_probability is not None:
-            numbers.append(f"命中率 {float(hit_probability) * 100:.1f}%")
-        evidence = ""
-        if numbers:
-            evidence = (
-                '<details class="review-evidence"><summary>查看判断依据</summary>'
-                f'<div>{escape(" · ".join(numbers))}</div></details>'
+            metrics.append(f"{equity_basis}基准权益 {equity * 100:.1f}%")
+        if pot_odds is not None and pot_odds > 0 and equity is not None:
+            edge = (equity - pot_odds) * 100
+            metrics.append(f"基准权益差 {edge:+.1f}pct")
+        if outs is not None and outs > 0:
+            metrics.append(f"常见听牌 {outs} outs")
+        if draw_names:
+            metrics.append("听牌类型 " + " + ".join(draw_names))
+        if hit_probability is not None and hit_probability > 0 and outs:
+            hit_label = "到河牌命中" if _value(street_raw) == Street.FLOP.value else "下一张命中"
+            metrics.append(f"{hit_label} {hit_probability * 100:.1f}%")
+
+        formula = (
+            _pot_odds_formula(pot_odds, history_row)
+            if pot_odds is not None and pot_odds > 0
+            else ""
+        )
+        alternative = _recommended_action_text(review)
+        detail_lines = _detail_lines(review)
+        evidence_rows: list[str] = []
+        if formula:
+            evidence_rows.append(
+                '<div class="review-formula"><strong>赔率公式：</strong>'
+                f"{escape(formula)}</div>"
             )
+        if equity is not None:
+            evidence_rows.append(
+                f'<div class="review-equity-note">权益口径：{escape(equity_basis)}蒙特卡洛基准；'
+                "不是对手动作加权后的真实范围。</div>"
+            )
+        if detail_lines:
+            evidence_rows.append(
+                '<ul class="review-detail-lines">'
+                + "".join(f"<li>{escape(line)}</li>" for line in detail_lines)
+                + "</ul>"
+            )
+        evidence = ""
+        if evidence_rows:
+            evidence = (
+                '<details class="review-evidence"><summary>展开完整分析</summary>'
+                + "".join(evidence_rows)
+                + "</details>"
+            )
+        metrics_html = (
+            '<div class="review-metrics">'
+            + "".join(f'<span class="review-metric">{escape(item)}</span>' for item in metrics)
+            + "</div>"
+            if metrics
+            else ""
+        )
+        alternative_html = (
+            f'<div class="review-alternative">{escape(alternative)}</div>'
+            if alternative
+            else ""
+        )
         parts.append(
             f'<article class="feedback-card grade-{grade_class}">'
             '<div class="feedback-head">'
@@ -656,6 +832,8 @@ def review_cards_html(
             f'<span class="rating">{escape(rating)}</span>'
             "</div>"
             f'<div class="reason">{escape(reason)}</div>'
+            f"{metrics_html}"
+            f"{alternative_html}"
             f"{evidence}"
             "</article>"
         )
