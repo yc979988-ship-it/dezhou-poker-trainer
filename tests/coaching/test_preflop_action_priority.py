@@ -124,7 +124,9 @@ def test_weak_threebet_does_not_create_a_sizing_training_opportunity(
     assert THREEBET_SIZING_OPPORTUNITY not in review.reason_codes
 
 
-def test_marginal_button_open_still_receives_open_size_context(six_seats) -> None:
+def test_k9o_button_open_is_in_the_v4_range_and_receives_size_context(
+    six_seats,
+) -> None:
     hand = HoldemHand(
         six_seats(),
         seed=306,
@@ -137,7 +139,8 @@ def test_marginal_button_open_still_receives_open_size_context(six_seats) -> Non
     record = _act(hand, "BTN", ActionType.RAISE, 120)
     review = review_decision(context, record, trials=10)
 
-    assert review.rating == ActionRating.LOOSE_OR_TIGHT
-    assert review.recommended_action == "弃牌；若开池则加注到约 120"
+    assert review.rating == ActionRating.RECOMMENDED
+    assert review.recommended_action == "加注到约 120"
+    assert any("牌型 K9o" in line for line in review.detail_lines)
     assert any("开池参考中点约 120" in line for line in review.detail_lines)
     assert PREFLOP_RAISE_TOO_SMALL not in review.reason_codes

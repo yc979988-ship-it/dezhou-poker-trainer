@@ -24,9 +24,18 @@ from poker_trainer.engine.models import (
 )
 
 from .equity import analyze_common_draws, calculate_pot_odds, estimate_equity
+from .preflop_strategy import (
+    ActionRole,
+    PreflopPlan,
+    PreflopSituation,
+    PreflopSpot,
+    StrategicAction,
+    build_preflop_plan,
+)
 
 
-PREFLOP_HEURISTIC_VERSION = "6max-100bb-preflop-v3"
+PREFLOP_HEURISTIC_VERSION = "6max-100bb-preflop-v4"
+POSTFLOP_HEURISTIC_VERSION = "postflop-random-equity-v2"
 NOT_FULL_GTO_NOTICE = "MVP 为启发式离线教练，不是完整 GTO 求解器。"
 RANDOM_EQUITY_BASIS = "random_unknown_hands"
 
@@ -343,20 +352,6 @@ def _effective_bet_to(context: CoachContext, record: ActionRecord) -> int:
     return min(record.bet_to, _effective_max_to(context))
 
 
-def _preflop_bucket(snapshot: DecisionSnapshot) -> str:
-    first, second = snapshot.hole_cards
-    high, low = sorted((first.rank, second.rank), reverse=True)
-    pair = high == low
-    suited = first.suit == second.suit
-    if pair and high >= 11 or {high, low} == {14, 13}:
-        return "premium"
-    if pair and high >= 8 or high == 14 and low >= 11 or suited and high >= 13 and low >= 11:
-        return "strong"
-    if pair or high == 14 and suited or high >= 11 and low >= 10 or suited and high - low <= 2 and low >= 6:
-        return "playable"
-    return "weak"
-
-
 def _preflop_limp_count(context: CoachContext) -> int:
     return sum(
         1
@@ -425,172 +420,310 @@ def _is_initial_sb_raise_response(context: CoachContext) -> bool:
     )
 
 
-def _weak_aggression_feedback(context: CoachContext) -> tuple[ActionRating, str]:
-    """弱牌先评价是否应主动投入，而不是先给出加注尺度。
+def _preflop_opener_position(context: CoachContext) -> Position | None:
+    """返回第一名非强制翻前进攻者的位置。"""
 
-    尺度基准只回答“决定加注以后加多少”。当起手牌、位置和前序动作
-    已使主动加注本身不合适时，继续推荐一个更大的数字会误导新手。
-    """
+    return next(
+        (
+            row.position
+            for row in context.history
+            if row.street == Street.PREFLOP
+            and not row.forced
+            and _is_aggressive(row)
+        ),
+        None,
+    )
 
+
+def _preflop_callers_after_raise(context: CoachContext) -> int:
+    """计算第一次加注后的跟注者，用于区分普通 3bet 与 squeeze。"""
+
+    opener = next(
+        (
+            row
+            for row in context.history
+            if row.street == Street.PREFLOP
+            and not row.forced
+            and _is_aggressive(row)
+        ),
+        None,
+    )
+    if opener is None:
+        return 0
+    return sum(
+        1
+        for row in context.history
+        if row.street == Street.PREFLOP
+        and row.sequence > opener.sequence
+        and not row.forced
+        and _is_call(row)
+        and row.current_bet_before == opener.bet_to
+    )
+
+
+def _preflop_situation(context: CoachContext) -> PreflopSituation:
     snapshot = context.snapshot
-    limpers = _preflop_limp_count(context)
-    if snapshot.preflop_raise_count >= 1:
-        return (
-            ActionRating.CLEAR_ERROR,
-            "弱牌面对既有加注再次加注过松；应先收紧范围，而不是调整加注尺度。",
+    return PreflopSituation(
+        hole_cards=(snapshot.hole_cards[0], snapshot.hole_cards[1]),
+        position=snapshot.position,
+        raise_count=snapshot.preflop_raise_count,
+        limpers=_preflop_limp_count(context),
+        callers_after_raise=_preflop_callers_after_raise(context),
+        opener_position=_preflop_opener_position(context),
+        effective_stack_bb=_effective_max_to(context) / context.big_blind,
+        can_check=context.legal_actions.can_check,
+    )
+
+
+def _strategic_action(record: ActionRecord) -> StrategicAction:
+    if record.action == ActionType.FOLD:
+        return StrategicAction.FOLD
+    if record.action == ActionType.CHECK:
+        return StrategicAction.CHECK
+    if _is_call(record):
+        return StrategicAction.CALL
+    if _is_aggressive(record):
+        return StrategicAction.RAISE
+    raise ValueError(f"无法评价翻前动作: {record.action.value}")
+
+
+def _role_rating(role: ActionRole) -> ActionRating:
+    return {
+        ActionRole.PRIMARY: ActionRating.RECOMMENDED,
+        ActionRole.ACCEPTABLE: ActionRating.ACCEPTABLE,
+        ActionRole.MIXED: ActionRating.ACCEPTABLE,
+        ActionRole.DISCOURAGED: ActionRating.LOOSE_OR_TIGHT,
+        ActionRole.ERROR: ActionRating.CLEAR_ERROR,
+    }[role]
+
+
+def _preflop_action_label(plan: PreflopPlan, action: StrategicAction) -> str:
+    if action == StrategicAction.CALL and plan.spot == PreflopSpot.LIMPED:
+        return "补齐" if plan.position == Position.SB else "跟注"
+    return action.label_zh
+
+
+def _strategic_action_is_legal(
+    context: CoachContext,
+    action: StrategicAction,
+) -> bool:
+    legal = context.legal_actions
+    if action == StrategicAction.FOLD:
+        return legal.can_fold
+    if action == StrategicAction.CHECK:
+        return legal.can_check
+    if action == StrategicAction.CALL:
+        return legal.can_call or (
+            legal.can_all_in and legal.max_to <= context.snapshot.current_bet
         )
-    if limpers:
-        severe = snapshot.position in {Position.SB, Position.BB} or limpers >= 2
-        position_note = (
-            "位置较差、" if snapshot.position in {Position.SB, Position.BB} else ""
+    return legal.can_bet or legal.can_raise or (
+        legal.can_all_in and legal.max_to > context.snapshot.current_bet
+    )
+
+
+def _recommended_preflop_actions(
+    context: CoachContext,
+    plan: PreflopPlan,
+    actual_action: StrategicAction,
+    actual_role: ActionRole,
+) -> tuple[StrategicAction, ...]:
+    """选择可执行建议；正确动作只显示自身，错误动作显示最佳替代。"""
+
+    if actual_role in {ActionRole.PRIMARY, ActionRole.ACCEPTABLE, ActionRole.MIXED}:
+        preferred = (actual_action,)
+    else:
+        preferred = tuple(
+            option.action
+            for option in plan.options
+            if option.role
+            in {ActionRole.PRIMARY, ActionRole.ACCEPTABLE, ActionRole.MIXED}
         )
-        return (
-            ActionRating.CLEAR_ERROR if severe else ActionRating.LOOSE_OR_TIGHT,
-            f"弱牌隔离 {limpers} 名 limp 玩家过松：{position_note}又很难让偏松对手弃牌。",
+    legal_preferred = tuple(
+        action
+        for action in preferred
+        if _strategic_action_is_legal(context, action)
+    )
+    if legal_preferred:
+        return legal_preferred
+
+    role_order = {
+        ActionRole.PRIMARY: 0,
+        ActionRole.ACCEPTABLE: 1,
+        ActionRole.MIXED: 1,
+        ActionRole.DISCOURAGED: 2,
+        ActionRole.ERROR: 3,
+    }
+    legal_options = sorted(
+        (
+            option
+            for option in plan.options
+            if _strategic_action_is_legal(context, option.action)
+        ),
+        key=lambda option: role_order[option.role],
+    )
+    return (legal_options[0].action,) if legal_options else ()
+
+
+def _preflop_recommendation_text(
+    context: CoachContext,
+    plan: PreflopPlan,
+    actual_action: StrategicAction,
+    actual_role: ActionRole,
+) -> str | None:
+    if (
+        plan.spot == PreflopSpot.LIMPED
+        and plan.position == Position.SB
+        and plan.primary.action == StrategicAction.FOLD
+        and actual_action == StrategicAction.CALL
+        and actual_role == ActionRole.DISCOURAGED
+    ):
+        return "弃牌；桌面极被动时可补齐"
+    actions = _recommended_preflop_actions(
+        context,
+        plan,
+        actual_action,
+        actual_role,
+    )
+    return "或".join(_preflop_action_label(plan, action) for action in actions) or None
+
+
+def _preflop_detail_lines(
+    plan: PreflopPlan,
+    actual_action: StrategicAction,
+) -> list[str]:
+    details = [
+        f"牌型 {plan.hand_key}｜位置 {plan.position.value}｜场景 {plan.spot.label_zh}。",
+        (
+            f"默认：{_preflop_action_label(plan, plan.primary.action)}。"
+            f"{plan.primary.explanation}"
+        ),
+    ]
+    alternatives = tuple(
+        option
+        for option in plan.options
+        if option.role in {ActionRole.ACCEPTABLE, ActionRole.MIXED}
+    )
+    for option in alternatives:
+        prefix = "混合" if option.role == ActionRole.MIXED else "可接受"
+        details.append(
+            f"{prefix}：{_preflop_action_label(plan, option.action)}。"
+            f"{option.explanation}"
         )
-    return ActionRating.LOOSE_OR_TIGHT, "弱牌主动开池范围偏松，应优先弃牌。"
+    selected = plan.option_for(actual_action)
+    if selected.role not in {ActionRole.PRIMARY, ActionRole.ACCEPTABLE, ActionRole.MIXED}:
+        details.append(
+            f"本次动作：{_preflop_action_label(plan, actual_action)}。"
+            f"{selected.explanation}"
+        )
+    if selected.conditions:
+        details.append(f"适用条件：{'；'.join(selected.conditions)}。")
+    return details
 
 
 def _review_preflop(context: CoachContext, record: ActionRecord) -> DecisionReview:
     snapshot = context.snapshot
-    legal = context.legal_actions
-    bucket = _preflop_bucket(snapshot)
-    pot_odds = _contestable_pot_odds(context)
+    plan = build_preflop_plan(_preflop_situation(context))
+    actual_action = _strategic_action(record)
+    selected = plan.option_for(actual_action)
+    rating = _role_rating(selected.role)
+    reason = selected.explanation
     codes: list[str] = []
-    details: list[str] = []
-    recommended_action: str | None = None
+    details = _preflop_detail_lines(plan, actual_action)
+    recommended_action = _preflop_recommendation_text(
+        context,
+        plan,
+        actual_action,
+        selected.role,
+    )
+
     sb_cold_call_spot = _is_initial_sb_raise_response(context)
     if sb_cold_call_spot:
         codes.append(SB_COLD_CALL_OPPORTUNITY)
-
-    if record.action == ActionType.FOLD:
-        if legal.can_check:
-            rating, reason = ActionRating.CLEAR_ERROR, "可以免费看牌，不应弃牌。"
-            recommended_action = "过牌"
-        elif bucket == "premium":
-            rating, reason = ActionRating.CLEAR_ERROR, "强起手牌弃得过紧。"
-            recommended_action = "加注"
-        elif bucket == "strong":
-            rating, reason = ActionRating.LOOSE_OR_TIGHT, "这类强牌通常可继续。"
-            recommended_action = "跟注或加注"
-        else:
-            rating, reason = ActionRating.RECOMMENDED, "牌力与位置不足，弃牌合理。"
-            recommended_action = "弃牌"
-    elif record.action == ActionType.CHECK:
-        rating, reason = ActionRating.RECOMMENDED, "大盲可免费看翻牌。"
-        recommended_action = "过牌"
-    elif _is_call(record):
-        if sb_cold_call_spot:
+        if actual_action == StrategicAction.CALL:
             codes.append(SB_COLD_CALL)
-            if bucket == "weak":
-                rating = ActionRating.CLEAR_ERROR
-                recommended_action = "弃牌"
-                reason = "小盲用弱牌冷跟会长期受位置劣势影响，应弃牌。"
-            elif bucket in {"premium", "strong"}:
-                rating = ActionRating.LOOSE_OR_TIGHT
-                recommended_action = "加注"
-                reason = "小盲强牌冷跟可少量混合，但默认加注更能取值并减少多人底池。"
-            else:
-                rating = ActionRating.LOOSE_OR_TIGHT
-                recommended_action = "弃牌或加注"
-                reason = "小盲冷跟不能只看即时赔率，还要计入位置差和 BB 挤压风险。"
-        elif bucket in {"premium", "strong", "playable"}:
-            rating, reason = ActionRating.ACCEPTABLE, "跟注可接受，但仍要结合位置与范围。"
-            recommended_action = "跟注"
-        elif snapshot.preflop_raise_count == 0:
-            rating, reason = ActionRating.LOOSE_OR_TIGHT, "弱牌 limp 容易被动，范围偏松。"
-            recommended_action = (
-                "弃牌；桌面极被动时可补齐"
-                if snapshot.position == Position.SB
-                else "弃牌或加注"
-            )
-        else:
-            rating, reason = ActionRating.CLEAR_ERROR, "弱牌面对加注继续过松。"
-            recommended_action = "弃牌"
-    elif _is_aggressive(record):
+            if selected.role in {ActionRole.DISCOURAGED, ActionRole.ERROR}:
+                reason = (
+                    "小盲冷跟不能只看即时赔率，还要计入位置差和 BB 挤压风险。"
+                )
+
+    aggression_allowed = selected.role in {
+        ActionRole.PRIMARY,
+        ActionRole.ACCEPTABLE,
+        ActionRole.MIXED,
+    }
+    if actual_action == StrategicAction.RAISE and not aggression_allowed:
         limpers = _preflop_limp_count(context)
-        weak_range_error = bucket == "weak" and (
-            snapshot.preflop_raise_count >= 1 or limpers > 0
+        if selected.role == ActionRole.ERROR and snapshot.preflop_raise_count >= 1:
+            reason = (
+                "弱牌面对既有加注再次加注过松；应先收紧范围，"
+                "而不是调整加注尺度。"
+            )
+        elif selected.role == ActionRole.ERROR and limpers:
+            position_note = (
+                "位置较差、" if snapshot.position in {Position.SB, Position.BB} else ""
+            )
+            reason = (
+                f"弱牌隔离 {limpers} 名 limp 玩家过松："
+                f"{position_note}又很难让偏松对手弃牌。"
+            )
+        details.append(
+            "本次先评价具体牌型、位置与前序动作；主动加注本身不合适，"
+            "因此不提供加注尺度建议。"
         )
-        if weak_range_error:
-            rating, reason = _weak_aggression_feedback(context)
-            if record.is_all_in:
-                rating = _worse(rating, ActionRating.CLEAR_ERROR)
-            recommended_action = "弃牌"
-            details.append(
-                "本次先评价起手牌、位置与前序动作；主动加注本身不合适，"
-                "因此不提供更大的加注尺度建议。"
-            )
-        else:
-            rating = (
-                ActionRating.RECOMMENDED
-                if bucket in {"premium", "strong"}
-                else ActionRating.ACCEPTABLE
-                if bucket == "playable"
-                else ActionRating.LOOSE_OR_TIGHT
-            )
-            if bucket == "weak":
-                reason = "弱牌开池属于位置敏感的边缘动作，范围不宜过宽。"
-                recommended_action = "弃牌或按标准尺度开池"
+
+    if actual_action == StrategicAction.RAISE and aggression_allowed:
+        reference_data = _preflop_raise_reference(context)
+        if reference_data is not None:
+            label, reference = reference_data
+            effective_max = _effective_max_to(context)
+            effective_to = _effective_bet_to(context, record)
+            can_use_normal_size = effective_max >= reference * 0.85
+            if label == "3bet" and can_use_normal_size:
+                codes.append(THREEBET_SIZING_OPPORTUNITY)
+            if can_use_normal_size:
+                lower_bound = (
+                    0.85
+                    if label == "3bet"
+                    else 0.65
+                    if label == "开池"
+                    else 0.75
+                )
+                upper_bound = 1.75 if label != "隔离加注" else 1.60
+                ratio = effective_to / reference
+                details.append(
+                    f"尺度：{label}参考中点约 {reference}，实际有效到 {effective_to}。"
+                )
+                recommended_action = f"加注到约 {reference}"
+                if ratio < lower_bound:
+                    codes.append(PREFLOP_RAISE_TOO_SMALL)
+                    if label == "3bet":
+                        codes.append(THREEBET_TOO_SMALL)
+                    rating = _worse(
+                        rating,
+                        ActionRating.CLEAR_ERROR
+                        if ratio < 0.60
+                        else ActionRating.LOOSE_OR_TIGHT,
+                    )
+                    reason = (
+                        f"{label}到 {effective_to} 偏小，参考约 {reference}；"
+                        "过小会给多人便宜跟注。"
+                    )
+                elif ratio > upper_bound:
+                    codes.append(PREFLOP_RAISE_TOO_LARGE)
+                    if label == "3bet":
+                        codes.append(THREEBET_TOO_LARGE)
+                    rating = _worse(
+                        rating,
+                        ActionRating.CLEAR_ERROR
+                        if ratio >= 2.50
+                        else ActionRating.LOOSE_OR_TIGHT,
+                    )
+                    reason = (
+                        f"{label}到 {effective_to} 偏大，参考约 {reference}；"
+                        "投入与可赢底池不成比例。"
+                    )
             else:
-                reason = "主动加注与当前起手牌强度基本匹配。"
-                recommended_action = "加注"
-            reference_data = _preflop_raise_reference(context)
-            if reference_data is not None:
-                label, reference = reference_data
-                effective_max = _effective_max_to(context)
-                effective_to = _effective_bet_to(context, record)
-                can_use_normal_size = effective_max >= reference * 0.85
-                if label == "3bet" and can_use_normal_size:
-                    codes.append(THREEBET_SIZING_OPPORTUNITY)
-                if can_use_normal_size:
-                    lower_bound = (
-                        0.85
-                        if label == "3bet"
-                        else 0.65
-                        if label == "开池"
-                        else 0.75
-                    )
-                    upper_bound = 1.75 if label != "隔离加注" else 1.60
-                    ratio = effective_to / reference
-                    details.append(
-                        f"{label}参考中点约 {reference}，实际有效到 {effective_to}。"
-                    )
-                    recommended_action = (
-                        f"弃牌；若开池则加注到约 {reference}"
-                        if bucket == "weak"
-                        else f"加注到约 {reference}"
-                    )
-                    if ratio < lower_bound:
-                        codes.append(PREFLOP_RAISE_TOO_SMALL)
-                        if label == "3bet":
-                            codes.append(THREEBET_TOO_SMALL)
-                        rating = _worse(
-                            rating,
-                            ActionRating.CLEAR_ERROR
-                            if ratio < 0.60
-                            else ActionRating.LOOSE_OR_TIGHT,
-                        )
-                        reason = (
-                            f"{label}到 {effective_to} 偏小，参考约 {reference}；"
-                            "过小会给多人便宜跟注。"
-                        )
-                    elif ratio > upper_bound:
-                        codes.append(PREFLOP_RAISE_TOO_LARGE)
-                        if label == "3bet":
-                            codes.append(THREEBET_TOO_LARGE)
-                        rating = _worse(
-                            rating,
-                            ActionRating.CLEAR_ERROR
-                            if ratio >= 2.50
-                            else ActionRating.LOOSE_OR_TIGHT,
-                        )
-                        reason = (
-                            f"{label}到 {effective_to} 偏大，参考约 {reference}；"
-                            "投入与可赢底池不成比例。"
-                        )
-    else:
-        rating, reason = ActionRating.ACCEPTABLE, "动作可接受。"
+                details.append("有效后手不足以使用常规尺度，本次按短码全下处理。")
 
     return DecisionReview(
         sequence=record.sequence,
@@ -599,8 +732,8 @@ def _review_preflop(context: CoachContext, record: ActionRecord) -> DecisionRevi
         action=record.action,
         rating=rating,
         reason=reason,
-        reason_codes=tuple(codes),
-        pot_odds=pot_odds,
+        reason_codes=tuple(dict.fromkeys(codes)),
+        pot_odds=_contestable_pot_odds(context),
         equity=None,
         outs=None,
         hit_probability=None,
@@ -901,7 +1034,7 @@ def _review_postflop(
         equity=equity,
         outs=draw.outs,
         hit_probability=hit_probability,
-        heuristic_version=PREFLOP_HEURISTIC_VERSION,
+        heuristic_version=POSTFLOP_HEURISTIC_VERSION,
         recommended_action=recommended_action,
         detail_lines=tuple(details),
         draw_names=draw.names,
@@ -933,6 +1066,7 @@ __all__ = [
     "DRAW_ODDS_ERROR",
     "DRAW_ODDS_OPPORTUNITY",
     "NOT_FULL_GTO_NOTICE",
+    "POSTFLOP_HEURISTIC_VERSION",
     "PREFLOP_RAISE_TOO_LARGE",
     "PREFLOP_RAISE_TOO_SMALL",
     "PREFLOP_HEURISTIC_VERSION",
