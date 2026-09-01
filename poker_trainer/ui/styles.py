@@ -248,6 +248,17 @@ div[data-testid="stFormSubmitButton"] > button[kind="secondary"]:hover {
   font-size: .77rem;
   font-weight: 800;
 }
+.review-strategy {
+  margin-top: .42rem;
+  border-left: 3px solid #8db9a7;
+  border-radius: 0 8px 8px 0;
+  background: #f5f9f7;
+  color: #29483d;
+  padding: .36rem .5rem;
+  font-size: .76rem;
+  line-height: 1.42;
+}
+.review-strategy > div + div { margin-top: .18rem; }
 .feedback-card.grade-acceptable { border-left-color: #3976b8; }
 .feedback-card.grade-acceptable .rating { color: #21598f; background: #e9f2fb; }
 .feedback-card.grade-marginal { border-left-color: #d58a18; }
@@ -265,6 +276,8 @@ div[data-testid="stFormSubmitButton"] > button[kind="secondary"]:hover {
 .review-evidence { margin-top: .42rem; color: var(--muted); font-size: .74rem; }
 .review-evidence summary { cursor: pointer; font-weight: 750; }
 .review-evidence > div { padding-top: .3rem; line-height: 1.42; }
+.review-strategy-more { color: #355448; }
+.review-calculation { color: var(--muted); }
 .review-formula { color: #264c3e; font-variant-numeric: tabular-nums; }
 .review-equity-note { color: var(--muted); }
 .review-detail-lines { margin: .3rem 0 0; padding-left: 1.15rem; }

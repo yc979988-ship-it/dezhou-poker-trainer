@@ -1,7 +1,8 @@
 """离线牌后教练：只使用动作发生前可见的信息评价决策。
 
 本模块不是完整 GTO 求解器。翻前使用带版本号的 6-max 100bb 启发式，
-翻后用底池赔率、常见听牌与对未知随机手牌的蒙特卡洛权益给出短反馈。
+翻后按成牌强度、牌面结构、人数、压力、底池赔率与听牌质量给出反馈；
+未知随机手牌的蒙特卡洛权益只作参考。
 评价不读取结算结果、对手底牌或尚未发出的公共牌。
 """
 
@@ -32,10 +33,16 @@ from .preflop_strategy import (
     StrategicAction,
     build_preflop_plan,
 )
+from .postflop_strategy import (
+    BoardWetness,
+    MadeStrength,
+    PostflopProfile,
+    analyze_postflop_profile,
+)
 
 
 PREFLOP_HEURISTIC_VERSION = "6max-100bb-preflop-v4"
-POSTFLOP_HEURISTIC_VERSION = "postflop-random-equity-v2"
+POSTFLOP_HEURISTIC_VERSION = "postflop-structured-v3"
 NOT_FULL_GTO_NOTICE = "MVP 为启发式离线教练，不是完整 GTO 求解器。"
 RANDOM_EQUITY_BASIS = "random_unknown_hands"
 
@@ -813,7 +820,438 @@ def _small_pair_missed(snapshot: DecisionSnapshot) -> bool:
     )
 
 
-def _review_postflop(
+class _PressureLevel(str, Enum):
+    TINY = "tiny"
+    SMALL = "small"
+    MEDIUM = "medium"
+    LARGE = "large"
+    OVERBET = "overbet"
+
+
+@dataclass(frozen=True, slots=True)
+class _PressureState:
+    level: _PressureLevel
+    fraction: float
+    label_zh: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DrawPriceState:
+    raw_probability: float
+    conservative_probability: float
+    implied_buffer: float
+    direct_supported: bool
+    supported: bool
+    sees_both_cards: bool
+
+    @property
+    def only_implied(self) -> bool:
+        return self.supported and not self.direct_supported
+
+    def direct_margin(self, pot_odds: float) -> float:
+        return self.conservative_probability - pot_odds
+
+
+def _postflop_pressure(context: CoachContext) -> _PressureState:
+    bettor = _last_aggressive_record(context)
+    fraction = (
+        bettor.paid / bettor.pot_before
+        if bettor is not None and bettor.pot_before > 0
+        else 0.0
+    )
+    if fraction <= 0.20:
+        level, label = _PressureLevel.TINY, "微小下注"
+    elif fraction <= 0.50:
+        level, label = _PressureLevel.SMALL, "小注"
+    elif fraction <= 0.80:
+        level, label = _PressureLevel.MEDIUM, "中等下注"
+    elif fraction <= 1.25:
+        level, label = _PressureLevel.LARGE, "大注"
+    else:
+        level, label = _PressureLevel.OVERBET, "超池下注"
+    if bettor is not None and bettor.is_all_in:
+        label += "（全下）"
+    return _PressureState(level=level, fraction=fraction, label_zh=label)
+
+
+def _pressure_at_least(
+    pressure: _PressureState,
+    threshold: _PressureLevel,
+) -> bool:
+    order = {
+        _PressureLevel.TINY: 0,
+        _PressureLevel.SMALL: 1,
+        _PressureLevel.MEDIUM: 2,
+        _PressureLevel.LARGE: 3,
+        _PressureLevel.OVERBET: 4,
+    }
+    return order[pressure.level] >= order[threshold]
+
+
+def _aggressive_risk_ratio(context: CoachContext, record: ActionRecord) -> float:
+    effective_paid = max(
+        0,
+        _effective_bet_to(context, record) - context.snapshot.street_commitment,
+    )
+    return effective_paid / max(1, context.snapshot.pot_before)
+
+
+def _draw_price_state(
+    context: CoachContext,
+    profile: PostflopProfile,
+    draw: Any,
+    pot_odds: float,
+) -> _DrawPriceState:
+    """返回可解释的直接赔率与隐含赔率状态。
+
+    普通翻牌跟注先按下一张牌计算；英雄跟注后自己全下，或所有仍在局
+    对手都已全下时，才视为已经买到转河两张牌。成对牌面和多人底池会
+    折损原始 outs；只有深度足够且牌面较干净时才给隐含赔率缓冲。
+    """
+
+    snapshot = context.snapshot
+    hero_all_in_after_call = context.legal_actions.call_amount >= snapshot.stack
+    live_opponents = tuple(
+        row
+        for row in context.commitments
+        if row.player_id != snapshot.player_id and not row.folded
+    )
+    all_opponents_all_in = bool(live_opponents) and all(
+        row.all_in for row in live_opponents
+    )
+    sees_both_cards = bool(
+        snapshot.street == Street.FLOP
+        and (hero_all_in_after_call or all_opponents_all_in)
+    )
+    raw_probability = draw.hit_by_river if sees_both_cards else draw.hit_next
+    discount = 1.0
+    if profile.texture.paired:
+        discount -= 0.08
+    if profile.multiway:
+        discount -= 0.07
+    conservative_probability = raw_probability * max(0.75, discount)
+    hero_after_call = max(0, snapshot.stack - context.legal_actions.call_amount)
+    opponent_after_call = max(
+        (
+            max(0, row.stack - max(0, snapshot.current_bet - row.street_commitment))
+            for row in live_opponents
+            if not row.all_in
+        ),
+        default=0,
+    )
+    effective_after_call = min(hero_after_call, opponent_after_call)
+    implied_buffer = 0.0
+    if (
+        not sees_both_cards
+        and effective_after_call >= 10 * context.big_blind
+        and not profile.texture.paired
+        and not profile.texture.four_flush
+    ):
+        implied_buffer = 0.06 if snapshot.street == Street.FLOP else 0.03
+        if profile.multiway:
+            implied_buffer = min(implied_buffer, 0.02)
+    direct_supported = conservative_probability >= pot_odds
+    supported = conservative_probability + implied_buffer >= pot_odds
+    return _DrawPriceState(
+        raw_probability=raw_probability,
+        conservative_probability=conservative_probability,
+        implied_buffer=implied_buffer,
+        direct_supported=direct_supported,
+        supported=supported,
+        sees_both_cards=sees_both_cards,
+    )
+
+
+def _vulnerable_strong_made(profile: PostflopProfile) -> bool:
+    category = profile.rank.category
+    return bool(
+        profile.texture.four_flush and category < HandCategory.FLUSH
+        or profile.texture.four_straight and category < HandCategory.STRAIGHT
+    )
+
+
+def _near_nut_made(profile: PostflopProfile) -> bool:
+    """只给真正很强的牌豁免超大取值尺度检查。"""
+
+    return profile.rank.category >= HandCategory.FULL_HOUSE
+
+
+def _facing_bet_decision(
+    context: CoachContext,
+    record: ActionRecord,
+    profile: PostflopProfile,
+    *,
+    draw_outs: int,
+    draw_price: _DrawPriceState,
+    pot_odds: float,
+    pressure: _PressureState,
+) -> tuple[ActionRating, str, str]:
+    fold = record.action == ActionType.FOLD
+    call = _is_call(record)
+    aggressive = _is_aggressive(record)
+    strength = profile.strength
+    wet = profile.texture.wetness == BoardWetness.WET
+    large = _pressure_at_least(pressure, _PressureLevel.LARGE)
+    overbet = pressure.level == _PressureLevel.OVERBET
+    strong_draw = draw_outs >= 8
+    clean_draw = not profile.multiway and not profile.texture.paired
+
+    if profile.board_locked:
+        if fold:
+            return ActionRating.CLEAR_ERROR, "公共牌已锁定同牌平分，弃牌会放弃应得底池份额。", "跟注"
+        if call:
+            return ActionRating.RECOMMENDED, "公共牌已锁定同牌平分，跟注可拿回自己的投入并分享原底池。", "跟注"
+        if aggressive:
+            return ActionRating.LOOSE_OR_TIGHT, "公共牌已锁定平分；加注不能提高牌力，默认跟注即可。", "跟注"
+
+    made_plus_strong_draw = bool(
+        strong_draw
+        and strength
+        in {
+            MadeStrength.WEAK_PAIR,
+            MadeStrength.MEDIUM_PAIR,
+            MadeStrength.TOP_PAIR_WEAK,
+            MadeStrength.TOP_PAIR_STRONG,
+            MadeStrength.OVERPAIR,
+        }
+    )
+    if made_plus_strong_draw and (draw_price.supported or not large):
+        if fold:
+            return (
+                ActionRating.LOOSE_OR_TIGHT,
+                f"{strength.label_zh}兼有强听牌，普通压力下直接弃牌偏紧。",
+                "跟注",
+            )
+        if call:
+            rating = (
+                ActionRating.RECOMMENDED
+                if draw_price.direct_supported and clean_draw and not wet
+                else ActionRating.ACCEPTABLE
+            )
+            return (
+                rating,
+                f"{strength.label_zh}兼有强听牌，成牌摊牌值与听牌权益共同支持继续。",
+                "跟注",
+            )
+        if aggressive:
+            rating = ActionRating.LOOSE_OR_TIGHT if large else ActionRating.ACCEPTABLE
+            return (
+                rating,
+                f"{strength.label_zh}兼有强听牌可以半诈唬，但仍应控制加注尺度。",
+                "跟注或小尺度加注",
+            )
+
+    if strength == MadeStrength.STRONG_MADE:
+        vulnerable = _vulnerable_strong_made(profile)
+        if vulnerable:
+            hazard = "四同花" if profile.texture.four_flush else "四连顺"
+            severe = overbet or (profile.multiway and large)
+            if fold:
+                rating = ActionRating.RECOMMENDED if severe else ActionRating.ACCEPTABLE
+                recommendation = "弃牌" if severe else "跟注或弃牌"
+                return rating, f"{hazard}牌面显著压低当前成牌；高压下可以弃牌。", recommendation
+            if call:
+                rating = ActionRating.LOOSE_OR_TIGHT if severe else ActionRating.ACCEPTABLE
+                recommendation = "弃牌" if severe else "跟注或弃牌"
+                return (
+                    rating,
+                    f"多人{hazard}牌面面对{pressure.label_zh}，两对或三条不能自动当坚果跟注。",
+                    recommendation,
+                )
+            if aggressive:
+                rating = ActionRating.CLEAR_ERROR if severe else ActionRating.LOOSE_OR_TIGHT
+                return rating, f"{hazard}牌面使当前成牌相对脆弱，不宜继续做大底池。", "跟注或弃牌"
+        cautious = profile.multiway or wet or large
+        if fold:
+            rating = ActionRating.LOOSE_OR_TIGHT if cautious and large else ActionRating.CLEAR_ERROR
+            return rating, "两对及以上通常应继续，直接弃牌过紧。", "跟注"
+        if call:
+            recommendation = "跟注" if cautious else "跟注或加注"
+            rating = ActionRating.ACCEPTABLE if cautious else ActionRating.RECOMMENDED
+            return rating, "两对及以上足以继续；复杂牌面先跟注可保留较弱范围。", recommendation
+        if aggressive:
+            rating = ActionRating.ACCEPTABLE if cautious else ActionRating.RECOMMENDED
+            recommendation = "跟注或加注" if cautious else "加注"
+            return rating, "强成牌可以主动取值，但湿润或多人底池要控制加注范围。", recommendation
+
+    if strength in {
+        MadeStrength.TOP_PAIR_WEAK,
+        MadeStrength.TOP_PAIR_STRONG,
+        MadeStrength.OVERPAIR,
+    }:
+        weak = strength == MadeStrength.TOP_PAIR_WEAK
+        caution = int(weak) + int(profile.multiway) + int(wet) + int(large)
+        if fold:
+            if weak and caution >= 2:
+                return ActionRating.RECOMMENDED, "弱顶对面对收紧后的大额范围，弃牌合理。", "弃牌"
+            rating = ActionRating.ACCEPTABLE if caution >= 2 else ActionRating.LOOSE_OR_TIGHT
+            return rating, "一对牌有摊牌价值；是否弃牌取决于人数、牌面和下注压力。", "跟注"
+        if call:
+            if weak and caution >= 3:
+                return (
+                    ActionRating.LOOSE_OR_TIGHT,
+                    "弱顶对在多人湿润牌面面对较大压力，跟注范围应明显收紧。",
+                    "弃牌",
+                )
+            if weak and caution >= 2 or not weak and caution >= 3:
+                return ActionRating.LOOSE_OR_TIGHT, "一对牌面对多重风险继续偏松。", "弃牌"
+            if caution:
+                return ActionRating.ACCEPTABLE, "一对牌可以跟注，但不宜把随机权益当成对下注范围的保证。", "跟注"
+            return ActionRating.RECOMMENDED, "单挑干燥牌面面对正常下注，一对牌继续合理。", "跟注"
+        if aggressive:
+            if caution >= 3:
+                return ActionRating.CLEAR_ERROR, "脆弱的一对牌不适合在高压场景继续做大底池。", "跟注或弃牌"
+            return ActionRating.LOOSE_OR_TIGHT, "一对牌加注会赶走诈唬并更多被强牌继续。", "跟注"
+
+    if strength in {MadeStrength.WEAK_SHOWDOWN, MadeStrength.BOARD_ONLY}:
+        kicker_plays = strength == MadeStrength.WEAK_SHOWDOWN
+        cheap = pot_odds <= (0.15 if kicker_plays else 0.08)
+        description = "底牌踢脚仍参与最终五张牌" if kicker_plays else "当前主要依靠公牌成牌"
+        if fold:
+            if cheap:
+                return ActionRating.LOOSE_OR_TIGHT, f"{description}，面对微小下注直接弃牌略紧。", "跟注或弃牌"
+            return ActionRating.RECOMMENDED, f"{description}，但面对正常压力通常应弃牌。", "弃牌"
+        if call:
+            if cheap:
+                return ActionRating.ACCEPTABLE, f"{description}；价格很低时可以抓诈唬。", "跟注或弃牌"
+            rating = ActionRating.CLEAR_ERROR if pot_odds >= 0.30 else ActionRating.LOOSE_OR_TIGHT
+            return rating, f"{description}，不足以支撑高价跟注。", "弃牌"
+        if aggressive:
+            rating = ActionRating.CLEAR_ERROR if large else ActionRating.LOOSE_OR_TIGHT
+            return rating, f"{description}；加注需要明确弃牌率，不能按强成牌取值。", "弃牌或跟注"
+
+    if strength in {MadeStrength.WEAK_PAIR, MadeStrength.MEDIUM_PAIR}:
+        cheap = pot_odds <= 0.12
+        tolerable = pot_odds <= 0.22 and not profile.multiway and not wet
+        if fold:
+            if cheap:
+                return ActionRating.LOOSE_OR_TIGHT, "价格很低，带摊牌价值的对子弃牌略紧。", "跟注"
+            return ActionRating.RECOMMENDED, "中弱对子面对正常压力应以弃牌控制损失。", "弃牌"
+        if call:
+            if cheap:
+                return ActionRating.RECOMMENDED, "下注很小，当前对子按价格跟注合理。", "跟注"
+            if tolerable:
+                return ActionRating.ACCEPTABLE, "单挑正常价格下可继续一次，但后续压力需收紧。", "跟注"
+            rating = ActionRating.CLEAR_ERROR if pot_odds >= 0.35 else ActionRating.LOOSE_OR_TIGHT
+            return rating, "中弱对子在多人、湿润或高价场景继续偏多。", "弃牌"
+        if aggressive:
+            rating = ActionRating.CLEAR_ERROR if large or profile.multiway or wet else ActionRating.LOOSE_OR_TIGHT
+            return rating, "中弱对子缺少足够取值目标，加注会把底池做得过大。", "跟注或弃牌"
+
+    pure_draw = draw_outs > 0 and strength in {MadeStrength.AIR, MadeStrength.BOARD_ONLY}
+    if pure_draw:
+        if fold:
+            if draw_price.direct_supported:
+                clear_miss = bool(
+                    strong_draw
+                    and clean_draw
+                    and draw_price.direct_margin(pot_odds) >= 0.05
+                )
+                rating = ActionRating.CLEAR_ERROR if clear_miss else ActionRating.LOOSE_OR_TIGHT
+                return rating, "听牌的折损后直接命中率覆盖赔率，弃牌过紧。", "跟注或加注"
+            if draw_price.only_implied:
+                return (
+                    ActionRating.ACCEPTABLE,
+                    "直接赔率略不足，但深筹码隐含赔率可补足；弃牌可以接受，跟注也有条件。",
+                    "弃牌或跟注",
+                )
+            return ActionRating.RECOMMENDED, "超池压力下听牌命中率不足以覆盖赔率，弃牌合理。", "弃牌"
+        if call:
+            if draw_price.supported:
+                rating = (
+                    ActionRating.RECOMMENDED
+                    if strong_draw and clean_draw and draw_price.direct_supported
+                    else ActionRating.ACCEPTABLE
+                )
+                reason = (
+                    "听牌的折损后直接命中率覆盖价格，继续合理。"
+                    if draw_price.direct_supported
+                    else "直接赔率略不足，但深筹码隐含赔率使跟注可以接受。"
+                )
+                return rating, reason, "跟注"
+            gap = pot_odds - draw_price.conservative_probability
+            rating = ActionRating.CLEAR_ERROR if gap >= 0.10 else ActionRating.LOOSE_OR_TIGHT
+            return rating, "听牌价格过高，原始 outs 不能覆盖本次跟注成本。", "弃牌"
+        if aggressive:
+            if not draw_price.supported:
+                return ActionRating.LOOSE_OR_TIGHT, "平跟赔率不足；半诈唬还需要足够弃牌率并控制尺度。", "弃牌或小尺度加注"
+            rating = (
+                ActionRating.ACCEPTABLE
+                if profile.multiway or wet
+                else ActionRating.RECOMMENDED
+                if strong_draw
+                else ActionRating.LOOSE_OR_TIGHT
+            )
+            return rating, "强听牌可半诈唬，但仍需单独控制加注尺度。", "跟注或加注"
+
+    if context.snapshot.street == Street.RIVER:
+        if fold:
+            return ActionRating.RECOMMENDED, "河牌已经没有未来权益，空气牌面对下注应弃牌。", "弃牌"
+        if call:
+            rating = ActionRating.LOOSE_OR_TIGHT if pot_odds <= 0.08 else ActionRating.CLEAR_ERROR
+            return rating, "河牌空气牌没有未来权益，跟注为负期望。", "弃牌"
+        if aggressive:
+            return ActionRating.CLEAR_ERROR, "河牌空气牌加注需要明确阻断与弃牌率，不能靠随机权益支撑。", "弃牌"
+
+    if fold:
+        return ActionRating.RECOMMENDED, "没有成牌或足够听牌，面对下注弃牌合理。", "弃牌"
+    if call:
+        rating = ActionRating.CLEAR_ERROR if pot_odds >= 0.25 else ActionRating.LOOSE_OR_TIGHT
+        return rating, "缺少成牌和足够 outs，跟注偏松。", "弃牌"
+    if aggressive:
+        return ActionRating.LOOSE_OR_TIGHT, "纯诈唬需要牌面和弃牌率支持，随机权益不能证明加注合理。", "弃牌或小尺度加注"
+    return ActionRating.ACCEPTABLE, "动作可以接受。", "跟注或弃牌"
+
+
+def _unopened_postflop_decision(
+    context: CoachContext,
+    record: ActionRecord,
+    profile: PostflopProfile,
+    *,
+    draw_outs: int,
+) -> tuple[ActionRating, str, str]:
+    strength = profile.strength
+    wet = profile.texture.wetness == BoardWetness.WET
+    aggressive = _is_aggressive(record)
+    if record.action == ActionType.FOLD:
+        return ActionRating.CLEAR_ERROR, "可以过牌保留权益，无需弃牌。", "过牌"
+    if record.action == ActionType.CHECK:
+        if strength == MadeStrength.STRONG_MADE:
+            return ActionRating.ACCEPTABLE, "强牌过牌可以诱导，但通常仍应考虑价值下注。", "下注"
+        if strength in {
+            MadeStrength.TOP_PAIR_STRONG,
+            MadeStrength.TOP_PAIR_WEAK,
+            MadeStrength.OVERPAIR,
+        }:
+            return ActionRating.ACCEPTABLE, "一对牌过牌控池可以接受，湿润牌面尤其需要保护范围。", "过牌或下注"
+        return ActionRating.RECOMMENDED, "当前牌力适合过牌保留权益。", "过牌"
+    if aggressive:
+        if strength == MadeStrength.STRONG_MADE:
+            return ActionRating.RECOMMENDED, "两对及以上主动价值下注合理。", "下注"
+        if strength in {
+            MadeStrength.TOP_PAIR_STRONG,
+            MadeStrength.TOP_PAIR_WEAK,
+            MadeStrength.OVERPAIR,
+        }:
+            rating = ActionRating.ACCEPTABLE if profile.multiway or wet else ActionRating.RECOMMENDED
+            return rating, "一对牌可以价值下注；多人或湿润牌面应减少薄价值范围。", "下注或过牌"
+        if strength in {MadeStrength.MEDIUM_PAIR, MadeStrength.WEAK_PAIR}:
+            if profile.multiway or wet:
+                return ActionRating.LOOSE_OR_TIGHT, "多人或湿润牌面用中弱对子下注偏薄。", "过牌"
+            return ActionRating.ACCEPTABLE, "单挑干燥牌面可小注保护，也可过牌控池。", "下注或过牌"
+        if draw_outs >= 8:
+            rating = ActionRating.ACCEPTABLE if profile.multiway or wet else ActionRating.RECOMMENDED
+            recommendation = "过牌或下注" if profile.multiway else "下注或过牌"
+            return rating, "强听牌可以半诈唬；多人底池应降低纯进攻频率。", recommendation
+        risk_ratio = _aggressive_risk_ratio(context, record)
+        if not profile.multiway and not wet and risk_ratio <= 0.60:
+            return ActionRating.ACCEPTABLE, "单挑合适牌面的小尺度诈唬可以接受。", "小尺度下注或过牌"
+        rating = ActionRating.CLEAR_ERROR if profile.multiway and risk_ratio > 0.80 else ActionRating.LOOSE_OR_TIGHT
+        return rating, "缺少摊牌价值的下注需要弃牌率；多人底池不宜频繁诈唬。", "过牌"
+    return ActionRating.ACCEPTABLE, "动作可以接受。", "过牌"
+
+
+def _review_postflop_random_v2(
     context: CoachContext, record: ActionRecord, *, trials: int
 ) -> DecisionReview:
     snapshot = context.snapshot
@@ -1022,6 +1460,309 @@ def _review_postflop(
         )
         details.append(f"按对手有效筹码，本次加注实际最多到 {effective_to}。")
 
+    return DecisionReview(
+        sequence=record.sequence,
+        player_id=record.player_id,
+        street=record.street,
+        action=record.action,
+        rating=rating,
+        reason=reason,
+        reason_codes=tuple(dict.fromkeys(codes)),
+        pot_odds=pot_odds,
+        equity=equity,
+        outs=draw.outs,
+        hit_probability=hit_probability,
+        heuristic_version=POSTFLOP_HEURISTIC_VERSION,
+        recommended_action=recommended_action,
+        detail_lines=tuple(details),
+        draw_names=draw.names,
+        equity_basis=RANDOM_EQUITY_BASIS,
+    )
+
+
+def _review_postflop(
+    context: CoachContext, record: ActionRecord, *, trials: int
+) -> DecisionReview:
+    """按牌力、牌面、人数、价格和尺度评价翻后动作。
+
+    随机未知手牌 Monte Carlo 仍作为可复核的基准展示，但不再直接充当
+    对手下注范围；动作规则先于权益基准，进攻尺度再单独校验。
+    """
+
+    snapshot = context.snapshot
+    pot_odds = _contestable_pot_odds(context)
+    profile = analyze_postflop_profile(
+        snapshot.hole_cards,
+        snapshot.board,
+        active_players=snapshot.active_players,
+    )
+    equity = estimate_equity(
+        snapshot.hole_cards,
+        snapshot.board,
+        opponents=max(1, snapshot.active_players - 1),
+        trials=trials,
+        seed=_equity_seed(context),
+    )
+    draw = analyze_common_draws(snapshot.hole_cards, snapshot.board)
+    facing_bet = context.legal_actions.to_call > 0
+    pressure = _postflop_pressure(context) if facing_bet else None
+    strong_draw = draw.outs >= 8
+    personal_made, made_hand_name, _made_category = _personal_made_hand(snapshot)
+    made_plus_draw = personal_made and draw.outs > 0
+    hit_probability = (
+        draw.hit_by_river if snapshot.street == Street.FLOP else draw.hit_next
+    )
+    draw_price = _DrawPriceState(
+        raw_probability=0.0,
+        conservative_probability=0.0,
+        implied_buffer=0.0,
+        direct_supported=False,
+        supported=False,
+        sees_both_cards=False,
+    )
+    if facing_bet and draw.outs > 0:
+        draw_price = _draw_price_state(context, profile, draw, pot_odds)
+
+    pressure_label = f"面对{pressure.label_zh}" if pressure is not None else "无人下注"
+    details = [
+        (
+            f"{profile.strength.label_zh}｜{profile.texture.label_zh}｜"
+            f"{profile.players_label_zh}｜{pressure_label}。"
+        )
+    ]
+    if facing_bet:
+        details.append(f"跟注盈亏平衡点为 {pot_odds:.1%}。")
+    details.append(
+        f"随机未知手牌基准权益约 {equity:.1%}；它不代表对手当前下注范围。"
+    )
+    if draw.outs > 0:
+        draw_window = "到河牌" if snapshot.street == Street.FLOP else "下一张"
+        details.append(
+            f"{draw.name}共 {draw.outs} 个原始 outs（未扣除脏 outs），"
+            f"{draw_window}原始命中率约 {hit_probability:.1%}。"
+        )
+        if facing_bet:
+            if draw_price.sees_both_cards:
+                details.append(
+                    f"跟注后已确保看到转河两张牌，本次按到河牌保守命中率约 "
+                    f"{draw_price.conservative_probability:.1%} 判断。"
+                )
+            else:
+                details.append(
+                    f"本次先按下一张保守命中率约 "
+                    f"{draw_price.conservative_probability:.1%} 判断；"
+                    "成对牌面和多人底池会折损。"
+                )
+            if draw_price.only_implied:
+                details.append(
+                    f"直接赔率尚差约 "
+                    f"{max(0.0, pot_odds - draw_price.conservative_probability):.1%}；"
+                    f"仅靠约 {draw_price.implied_buffer:.1%} 的深筹码隐含赔率缓冲才覆盖。"
+                )
+        if made_plus_draw:
+            details.append(
+                f"这是{made_hand_name}+听牌；未中听牌时，现有{made_hand_name}仍可能赢。"
+            )
+        else:
+            details.append("这是纯听牌；未命中时通常缺少现成摊牌价值。")
+    elif snapshot.street == Street.RIVER:
+        details.append("河牌不会再发公共牌，因此不计算未来 outs。")
+
+    if facing_bet and pressure is not None:
+        rating, reason, recommended_action = _facing_bet_decision(
+            context,
+            record,
+            profile,
+            draw_outs=draw.outs,
+            draw_price=draw_price,
+            pot_odds=pot_odds,
+            pressure=pressure,
+        )
+    else:
+        rating, reason, recommended_action = _unopened_postflop_decision(
+            context,
+            record,
+            profile,
+            draw_outs=draw.outs,
+        )
+
+    if _is_aggressive(record):
+        risk_ratio = _aggressive_risk_ratio(context, record)
+        details.append(f"进攻尺度约为动作前底池的 {risk_ratio:.0%}。")
+        if risk_ratio > 1.50 and not _near_nut_made(profile):
+            severe_size = bool(
+                risk_ratio >= 3.0 or record.is_all_in and risk_ratio >= 2.0
+            )
+            rating = _worse(
+                rating,
+                ActionRating.CLEAR_ERROR if severe_size else ActionRating.LOOSE_OR_TIGHT,
+            )
+            if draw.outs > 0:
+                reason = (
+                    "听牌可以继续，但本次全下/超大加注尺度投入过多；"
+                    "半诈唬动作合理不等于任意尺度合理。"
+                )
+                recommended_action = "跟注或加注"
+            elif facing_bet:
+                reason = "动作可能有一定权益，但本次加注尺度使风险明显过大。"
+                recommended_action = "跟注或弃牌"
+            else:
+                reason = "诈唬需要弃牌率支持，本次下注尺度投入过大。"
+                recommended_action = "过牌或小尺度下注"
+
+    codes: list[str] = []
+    if strong_draw and facing_bet:
+        codes.append(STRONG_DRAW_DECISION)
+    if facing_bet and draw.outs > 0:
+        codes.append(DRAW_ODDS_OPPORTUNITY)
+        if not made_plus_draw:
+            clean_direct_fold = bool(
+                record.action == ActionType.FOLD
+                and draw_price.direct_supported
+                and not profile.multiway
+                and not profile.texture.paired
+                and draw_price.direct_margin(pot_odds) >= 0.03
+            )
+            unsupported_call = _is_call(record) and not draw_price.supported
+            draw_error = clean_direct_fold or unsupported_call
+            if draw_error:
+                codes.append(DRAW_ODDS_ERROR)
+
+    if strong_draw and facing_bet and record.action == ActionType.FOLD and draw_price.supported:
+        codes.append(STRONG_DRAW_OVERFOLD)
+        if made_plus_draw:
+            if draw_price.direct_supported:
+                rating = _worse(rating, ActionRating.LOOSE_OR_TIGHT)
+            recommended_action = "通常跟注；对手范围极强时可弃牌"
+            reason = (
+                f"已有{made_hand_name}且兼有{draw.name}，通常应继续；"
+                "但结论仍取决于对手范围中的价值牌与半诈唬比例。"
+            )
+        else:
+            if draw_price.direct_supported:
+                clear_miss = bool(
+                    not profile.multiway
+                    and not profile.texture.paired
+                    and draw_price.direct_margin(pot_odds) >= 0.05
+                )
+                rating = _worse(
+                    rating,
+                    ActionRating.CLEAR_ERROR
+                    if clear_miss
+                    else ActionRating.LOOSE_OR_TIGHT,
+                )
+                recommended_action = "跟注或加注"
+                reason = "纯强听牌的折损后直接命中率覆盖底池赔率，弃牌过紧。"
+            else:
+                recommended_action = "弃牌或跟注"
+                reason = "直接赔率略不足；深筹码隐含赔率可支持跟注，但弃牌并非明显错误。"
+    elif (
+        strong_draw
+        and facing_bet
+        and record.action != ActionType.FOLD
+        and draw_price.supported
+        and rating in {ActionRating.ACCEPTABLE, ActionRating.RECOMMENDED}
+    ):
+        reason = (
+            f"已有{made_hand_name}且兼有{draw.name}，继续合理。"
+            if made_plus_draw
+            else "纯强听牌的价格条件支持继续。"
+        )
+
+    top_pair = profile.strength in {
+        MadeStrength.TOP_PAIR_WEAK,
+        MadeStrength.TOP_PAIR_STRONG,
+    }
+    weak_top_pair = profile.strength == MadeStrength.TOP_PAIR_WEAK
+    stackoff_decision = record.is_all_in or context.legal_actions.call_amount >= snapshot.stack
+    if top_pair and stackoff_decision:
+        codes.append(TOP_PAIR_STACKOFF_OPPORTUNITY)
+        if record.action != ActionType.FOLD and record.is_all_in:
+            codes.append(TOP_PAIR_STACKED_OFF)
+    wet_multiway_pressure = bool(
+        weak_top_pair
+        and facing_bet
+        and profile.multiway
+        and profile.texture.wetness == BoardWetness.WET
+        and pressure is not None
+        and _pressure_at_least(pressure, _PressureLevel.MEDIUM)
+    )
+    weak_top_pair_spot = bool(
+        weak_top_pair
+        and facing_bet
+        and (
+            stackoff_decision
+            or wet_multiway_pressure
+            or context.legal_actions.call_amount
+            >= context.legal_actions.pot_before * 0.5
+        )
+    )
+    if weak_top_pair_spot:
+        codes.append(WEAK_TOP_PAIR_DECISION)
+    protected_by_strong_draw = bool(
+        made_plus_draw
+        and strong_draw
+        and pressure is not None
+        and not _pressure_at_least(pressure, _PressureLevel.LARGE)
+    )
+    if weak_top_pair_spot and _is_call(record) and not protected_by_strong_draw:
+        codes.append(WEAK_TOP_PAIR_OVERCALL)
+        effective_paid = max(
+            0,
+            _effective_bet_to(context, record) - snapshot.street_commitment,
+        )
+        deep_commit = (
+            snapshot.stack >= 40 * context.big_blind
+            and effective_paid >= 25 * context.big_blind
+        )
+        rating = _worse(
+            rating,
+            ActionRating.CLEAR_ERROR if deep_commit else ActionRating.LOOSE_OR_TIGHT,
+        )
+        reason = (
+            "弱顶对在多人湿润牌面面对大额下注仍跟注，范围过宽。"
+            if wet_multiway_pressure
+            else "弱顶对面对大额投入仍跟到底，过度跟注。"
+        )
+        recommended_action = "弃牌"
+
+    small_pair_spot = _small_pair_missed(snapshot) and facing_bet
+    if small_pair_spot:
+        codes.append(SMALL_PAIR_POSTFLOP_DECISION)
+    if (
+        small_pair_spot
+        and record.action != ActionType.FOLD
+        and pot_odds > 0.10
+        and (
+            snapshot.street in {Street.TURN, Street.RIVER}
+            or equity < pot_odds + 0.08
+        )
+    ):
+        codes.append(SMALL_PAIR_OVERCONTINUE)
+        rating = _worse(
+            rating,
+            ActionRating.CLEAR_ERROR if record.is_all_in else ActionRating.LOOSE_OR_TIGHT,
+        )
+        reason = "小口袋对子未中三条，面对正常以上压力继续过多。"
+        recommended_action = "弃牌"
+
+    if _river_one_pair_overraise(context, record):
+        codes.append(RIVER_SHOWDOWN_VALUE_OVERPLAY)
+        effective_to = _effective_bet_to(context, record)
+        rating = _worse(rating, ActionRating.LOOSE_OR_TIGHT)
+        recommended_action = "跟注"
+        overplay_reason = (
+            "河牌一对牌已有抓诈唬价值；再加注会赶走诈唬和多数较弱牌，"
+            "主要被更强牌跟注。"
+        )
+        reason = (
+            f"本次全下尺度风险过大；{overplay_reason}"
+            if record.is_all_in and rating == ActionRating.CLEAR_ERROR
+            else overplay_reason
+        )
+        details.append(f"按对手有效筹码，本次加注实际最多到 {effective_to}。")
+
+    details.insert(1, f"结构化建议：{recommended_action}。{reason}")
     return DecisionReview(
         sequence=record.sequence,
         player_id=record.player_id,

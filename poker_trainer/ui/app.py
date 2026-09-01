@@ -621,7 +621,7 @@ def _optional_int(source: Any, *keys: str) -> int | None:
 
 
 def _recommended_action_text(review: Any) -> str:
-    """仅展示教练明确给出的替代动作/尺度，不自行补造建议。"""
+    """展示教练明确给出的打法，并按评分区分建议与纠错。"""
 
     raw_action = _read(review, "recommended_action")
     amount = _optional_int(
@@ -637,15 +637,17 @@ def _recommended_action_text(review: Any) -> str:
             action_name = ACTION_LABELS[ActionType(_value(raw_action))]
         except (TypeError, ValueError, KeyError):
             action_name = str(_value(raw_action)).strip()
+    rating = str(_value(_read(review, "rating", _read(review, "grade", ""))))
+    prefix = "更好的选择" if rating in {"偏松/偏紧", "明显错误"} else "建议打法"
     if action_name and amount is not None:
         connector = "到" if action_name in {"下注", "加注"} else " "
-        return f"推荐替代：{action_name}{connector}{amount:,}"
+        return f"{prefix}：{action_name}{connector}{amount:,}"
     if action_name:
-        return f"推荐替代：{action_name}"
+        return f"{prefix}：{action_name}"
     if amount is not None:
         return f"参考尺度：{amount:,}"
     if detail not in {None, ""}:
-        return f"推荐替代：{str(detail).strip()}"
+        return f"{prefix}：{str(detail).strip()}"
     return ""
 
 
@@ -824,28 +826,40 @@ def review_cards_html(
         )
         alternative = _recommended_action_text(review)
         detail_lines = _detail_lines(review)
-        evidence_rows: list[str] = []
+        strategy_lines = detail_lines[:2]
+        more_strategy_lines = detail_lines[2:]
+        strategy_html = (
+            '<div class="review-strategy">'
+            + "".join(f"<div>{escape(line)}</div>" for line in strategy_lines)
+            + "</div>"
+            if strategy_lines
+            else ""
+        )
+        strategy_evidence = ""
+        if more_strategy_lines:
+            strategy_evidence = (
+                '<details class="review-evidence review-strategy-more">'
+                '<summary>更多策略说明</summary>'
+                '<ul class="review-detail-lines">'
+                + "".join(f"<li>{escape(line)}</li>" for line in more_strategy_lines)
+                + "</ul></details>"
+            )
+        calculation_rows: list[str] = []
         if formula:
-            evidence_rows.append(
+            calculation_rows.append(
                 '<div class="review-formula"><strong>赔率公式：</strong>'
                 f"{escape(formula)}</div>"
             )
         if equity is not None:
-            evidence_rows.append(
+            calculation_rows.append(
                 f'<div class="review-equity-note">权益口径：{escape(equity_basis)}蒙特卡洛基准；'
                 "不是对手动作加权后的真实范围。</div>"
             )
-        if detail_lines:
-            evidence_rows.append(
-                '<ul class="review-detail-lines">'
-                + "".join(f"<li>{escape(line)}</li>" for line in detail_lines)
-                + "</ul>"
-            )
-        evidence = ""
-        if evidence_rows:
-            evidence = (
-                '<details class="review-evidence"><summary>展开完整分析</summary>'
-                + "".join(evidence_rows)
+        calculation_evidence = ""
+        if calculation_rows:
+            calculation_evidence = (
+                '<details class="review-evidence review-calculation"><summary>赔率与计算</summary>'
+                + "".join(calculation_rows)
                 + "</details>"
             )
         metrics_html = (
@@ -867,9 +881,11 @@ def review_cards_html(
             f'<span class="rating">{escape(rating)}</span>'
             "</div>"
             f'<div class="reason">{escape(reason)}</div>'
-            f"{metrics_html}"
+            f"{strategy_html}"
             f"{alternative_html}"
-            f"{evidence}"
+            f"{metrics_html}"
+            f"{strategy_evidence}"
+            f"{calculation_evidence}"
             "</article>"
         )
     parts.append("</div>")
@@ -1084,12 +1100,14 @@ def _summary_tiles_html(view: Mapping[str, Any], hero_stack: int) -> str:
 
 
 def seat_grid_html(view: Mapping[str, Any]) -> str:
-    """生成座位卡，并保留每位玩家最近一次自愿动作及金额。"""
+    """生成座位卡，只保留本街最近一次自愿动作及金额。"""
 
+    current_street = str(view.get("street_name", ""))
     latest_by_player = {
         str(row["玩家"]): row
         for row in view.get("history", ())
         if not bool(row.get("强制", False))
+        and str(row.get("街道", current_street)) == current_street
     }
     cells: list[str] = []
     for seat in view["seats"]:
@@ -1105,13 +1123,13 @@ def seat_grid_html(view: Mapping[str, Any]) -> str:
             state = ""
         elif seat["player_id"] == view["current_actor_id"]:
             state = "轮到你" if seat["is_hero"] else "正在行动"
-        elif recent is not None:
-            actor = "你" if seat["is_hero"] else str(_value(seat["position"]))
-            state = f'{actor}｜{recent["简述"]}'
         elif seat["folded"]:
             state = "已弃牌"
         elif seat["all_in"]:
             state = "已全下"
+        elif recent is not None:
+            actor = "你" if seat["is_hero"] else str(_value(seat["position"]))
+            state = f'{actor}｜{recent["简述"]}'
         else:
             state = ""
         cards = cards_html(

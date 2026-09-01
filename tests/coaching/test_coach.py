@@ -84,14 +84,14 @@ def test_negative_ev_river_call_is_clear_error(six_seats) -> None:
     json.dumps(review.as_dict(), ensure_ascii=False)
 
 
-def test_strong_draw_continue_is_recommended_but_fold_is_odds_error(six_seats) -> None:
+def test_strong_draw_supported_only_by_implied_odds_is_not_overstated(six_seats) -> None:
     continuing = _draw_decision(six_seats, seed=202)
     continue_context = capture_context(continuing, "BTN")
     continue_record = _act(continuing, "BTN", ActionType.CALL)
     continue_review = review_decision(continue_context, continue_record, trials=600)
 
     assert continue_review.outs == 9
-    assert continue_review.rating == ActionRating.RECOMMENDED
+    assert continue_review.rating == ActionRating.ACCEPTABLE
     assert DRAW_ODDS_OPPORTUNITY in continue_review.reason_codes
     assert DRAW_ODDS_ERROR not in continue_review.reason_codes
     assert STRONG_DRAW_OVERFOLD not in continue_review.reason_codes
@@ -105,14 +105,17 @@ def test_strong_draw_continue_is_recommended_but_fold_is_odds_error(six_seats) -
     fold_review = review_decision(fold_context, fold_record, trials=600)
 
     assert fold_review.outs == 9
-    assert fold_review.rating == ActionRating.CLEAR_ERROR
+    assert fold_review.rating in {
+        ActionRating.ACCEPTABLE,
+        ActionRating.LOOSE_OR_TIGHT,
+    }
     assert {
         DRAW_ODDS_OPPORTUNITY,
-        DRAW_ODDS_ERROR,
         STRONG_DRAW_OVERFOLD,
         STRONG_DRAW_DECISION,
     }.issubset(fold_review.reason_codes)
-    assert "纯强听牌" in fold_review.reason
+    assert DRAW_ODDS_ERROR not in fold_review.reason_codes
+    assert "隐含赔率" in fold_review.reason
 
 
 def test_threebet_below_eighty_five_percent_of_reference_is_flagged(six_seats) -> None:

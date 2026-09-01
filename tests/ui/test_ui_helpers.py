@@ -257,9 +257,10 @@ def test_action_timeline_is_grouped_compact_and_highlights_hero() -> None:
 def test_seat_cards_keep_latest_action_amount_and_highlight_hero() -> None:
     view = {
         "current_actor_id": None,
+        "street_name": "翻牌",
         "history": [
-            {"玩家": "hero", "简述": "跟注 120", "强制": False},
-            {"玩家": "villain", "简述": "加注到 350", "强制": False},
+            {"玩家": "hero", "街道": "翻牌", "简述": "跟注 120", "强制": False},
+            {"玩家": "villain", "街道": "翻牌", "简述": "加注到 350", "强制": False},
         ],
         "seats": [
             {
@@ -280,7 +281,7 @@ def test_seat_cards_keep_latest_action_amount_and_highlight_hero() -> None:
                 "position_name": "HJ（中位）",
                 "name": "对手1",
                 "stack": 3_650,
-                "folded": True,
+                "folded": False,
                 "all_in": False,
                 "is_hero": False,
                 "cards": (),
@@ -292,6 +293,42 @@ def test_seat_cards_keep_latest_action_amount_and_highlight_hero() -> None:
     assert 'class="seat-card hero"' in html
     assert "你｜跟注 120" in html
     assert "HJ｜加注到 350" in html
+
+
+def test_seat_cards_hide_previous_street_actions_and_keep_terminal_state() -> None:
+    view = {
+        "current_actor_id": None,
+        "street_name": "转牌",
+        "history": [
+            {"玩家": "live", "街道": "翻前", "简述": "跟注 120", "强制": False},
+            {"玩家": "folded", "街道": "翻牌", "简述": "弃牌", "强制": False},
+            {"玩家": "allin", "街道": "翻牌", "简述": "全下至 900", "强制": False},
+        ],
+        "seats": [
+            {
+                "player_id": player_id,
+                "position": position,
+                "position_name": full_position_name(position),
+                "name": player_id,
+                "stack": 3_000,
+                "folded": player_id == "folded",
+                "all_in": player_id == "allin",
+                "is_hero": False,
+                "cards": (),
+                "cards_hidden": True,
+            }
+            for player_id, position in (
+                ("live", Position.UTG),
+                ("folded", Position.HJ),
+                ("allin", Position.CO),
+            )
+        ],
+    }
+
+    html = seat_grid_html(view)
+    assert "跟注 120" not in html
+    assert "已弃牌" in html
+    assert "已全下" in html
 
 
 def test_statistics_table_always_has_six_positions_and_all_13_metrics() -> None:
@@ -376,11 +413,43 @@ def test_review_cards_link_exact_action_sequence_and_show_equity_gap() -> None:
     assert "常见听牌 4 outs" in html
     assert "听牌类型 卡顺听牌" in html
     assert "到河牌命中 16.0%" in html
-    assert "推荐替代：弃牌" in html
+    assert "更好的选择：弃牌" in html
     assert "300 ÷（700 + 300）= 30.0%" in html
     assert "不是对手动作加权后的真实范围" in html
     assert "多人底池应收紧继续范围。" in html
-    assert "展开完整分析" in html
+    assert "赔率与计算" in html
+
+
+def test_review_cards_keep_core_strategy_visible_and_split_extra_analysis() -> None:
+    html = review_cards_html(
+        [
+            {
+                "sequence": 3,
+                "street": "preflop",
+                "action": "raise",
+                "rating": "推荐",
+                "reason": "按钮位可以主动开池。",
+                "recommended_action": "加注到约 120",
+                "detail_lines": [
+                    "牌型 K9o｜位置 BTN｜场景 无人入池开池。",
+                    "默认：加注。",
+                    "可接受：桌面异常激进时收紧。",
+                ],
+                "equity": 0.54,
+            }
+        ]
+    )
+
+    assert '<div class="review-strategy">' in html
+    assert "牌型 K9o｜位置 BTN｜场景 无人入池开池。" in html
+    assert "默认：加注。" in html
+    assert "更多策略说明" in html
+    assert "可接受：桌面异常激进时收紧。" in html
+    assert "赔率与计算" in html
+    assert "展开完整分析" not in html
+    assert "建议打法：加注到约 120" in html
+    assert "推荐替代" not in html
+    assert "更好的选择" not in html
 
 
 def test_review_cards_do_not_invent_missing_math_or_alternative() -> None:
@@ -400,7 +469,8 @@ def test_review_cards_do_not_invent_missing_math_or_alternative() -> None:
     assert "所需胜率" not in html
     assert "基准权益" not in html
     assert "outs" not in html
-    assert "推荐替代" not in html
+    assert "建议打法" not in html
+    assert "更好的选择" not in html
 
 
 def test_review_cards_use_contestable_pot_formula_when_side_pot_is_not_known() -> None:
@@ -459,7 +529,7 @@ def test_review_cards_do_not_show_call_odds_for_a_raise() -> None:
         ],
     )
 
-    assert "推荐替代：弃牌" in html
+    assert "更好的选择：弃牌" in html
     assert "所需胜率" not in html
     assert "赔率公式" not in html
 
@@ -606,6 +676,8 @@ def test_mobile_css_has_touch_target_and_phone_breakpoint() -> None:
     assert ".review-overview" in MOBILE_CSS
     assert ".review-metrics" in MOBILE_CSS
     assert ".review-alternative" in MOBILE_CSS
+    assert ".review-strategy" in MOBILE_CSS
+    assert ".review-calculation" in MOBILE_CSS
     assert ".review-formula" in MOBILE_CSS
     assert ".replay-now" in MOBILE_CSS
     assert 'button[kind="secondary"]' in MOBILE_CSS
