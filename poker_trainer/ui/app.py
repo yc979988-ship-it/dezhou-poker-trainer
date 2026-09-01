@@ -268,6 +268,8 @@ def action_history_rows(history: Iterable[Any]) -> list[dict[str, Any]]:
                 "底池前": int(_read(record, "pot_before", 0) or 0),
                 "底池后": int(_read(record, "pot_after", 0) or 0),
                 "需跟": int(_read(record, "to_call_before", 0) or 0),
+                "当前下注前": int(_read(record, "current_bet_before", 0) or 0),
+                "当前下注后": int(_read(record, "current_bet_after", 0) or 0),
                 "强制": forced,
             }
         )
@@ -701,7 +703,11 @@ def _pot_odds_formula(pot_odds: float, history_row: Mapping[str, Any] | None) ->
     pot_before = _optional_int(history_row, "底池前")
     to_call = _optional_int(history_row, "需跟")
     paid = _optional_int(history_row, "投入")
-    call_amount = paid if action_code == ActionType.CALL.value and paid else to_call
+    call_amount = (
+        paid
+        if action_code in {ActionType.CALL.value, ActionType.ALL_IN.value} and paid
+        else to_call
+    )
     if pot_before is not None and call_amount and pot_before + call_amount > 0:
         simple_odds = call_amount / (pot_before + call_amount)
         # 普通底池可展示筹码代入；多人全下时总底池可能包含英雄无权
@@ -712,6 +718,27 @@ def _pot_odds_formula(pot_odds: float, history_row: Mapping[str, Any] | None) ->
                 f"= {result}"
             )
     return f"跟注额 ÷（可争夺底池 + 跟注额）= {result}"
+
+
+def _uses_call_price(
+    action: ActionType | None,
+    history_row: Mapping[str, Any] | None,
+) -> bool:
+    """只在弃牌/跟注决策中展示跟注赔率，避免拿它解释下注或加注。"""
+
+    if action in {ActionType.FOLD, ActionType.CALL}:
+        return True
+    if action != ActionType.ALL_IN or history_row is None:
+        return False
+
+    current_before = _optional_int(history_row, "当前下注前")
+    current_after = _optional_int(history_row, "当前下注后")
+    if current_before is not None and current_after is not None:
+        return current_after <= current_before
+
+    # 旧记录缺少下注前后状态时无法可靠区分短全下加注与全下跟注；
+    # 保守隐藏，避免把跟注赔率冒充加注 EV。
+    return False
 
 
 def review_cards_html(
@@ -747,13 +774,16 @@ def review_cards_html(
             street_name = str(_value(street_raw))
         action_raw = _read(review, "action", "")
         try:
-            action_name = ACTION_LABELS[ActionType(_value(action_raw))]
+            action_type: ActionType | None = ActionType(_value(action_raw))
+            action_name = ACTION_LABELS[action_type]
         except (TypeError, ValueError, KeyError):
+            action_type = None
             action_name = str(_value(action_raw))
         history_row = action_by_sequence.get(sequence)
         if history_row is not None:
             street_name = str(history_row.get("街道", street_name))
             action_name = str(history_row.get("简述", action_name))
+        uses_call_price = _uses_call_price(action_type, history_row)
 
         rating = str(_value(_read(review, "rating", _read(review, "grade", ""))))
         reason = str(_read(review, "reason", ""))
@@ -767,11 +797,16 @@ def review_cards_html(
 
         metrics: list[str] = []
         # 0% 表示本次没有面对跟注价格，不冒充一项有意义的“所需胜率”。
-        if pot_odds is not None and pot_odds > 0:
+        if uses_call_price and pot_odds is not None and pot_odds > 0:
             metrics.append(f"所需胜率 {pot_odds * 100:.1f}%")
         if equity is not None:
             metrics.append(f"{equity_basis}基准权益 {equity * 100:.1f}%")
-        if pot_odds is not None and pot_odds > 0 and equity is not None:
+        if (
+            uses_call_price
+            and pot_odds is not None
+            and pot_odds > 0
+            and equity is not None
+        ):
             edge = (equity - pot_odds) * 100
             metrics.append(f"基准权益差 {edge:+.1f}pct")
         if outs is not None and outs > 0:
@@ -784,7 +819,7 @@ def review_cards_html(
 
         formula = (
             _pot_odds_formula(pot_odds, history_row)
-            if pot_odds is not None and pot_odds > 0
+            if uses_call_price and pot_odds is not None and pot_odds > 0
             else ""
         )
         alternative = _recommended_action_text(review)

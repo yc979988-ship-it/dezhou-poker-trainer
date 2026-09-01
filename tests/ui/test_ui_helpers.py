@@ -431,6 +431,116 @@ def test_review_cards_use_contestable_pot_formula_when_side_pot_is_not_known() -
     assert "100 ÷（900 + 100）" not in html
 
 
+def test_review_cards_do_not_show_call_odds_for_a_raise() -> None:
+    html = review_cards_html(
+        [
+            {
+                "sequence": 5,
+                "street": "preflop",
+                "action": "raise",
+                "rating": "明显错误",
+                "reason": "弱牌不适合隔离多人 limp。",
+                "pot_odds": 0.10,
+                "recommended_action": "弃牌",
+            }
+        ],
+        history=[
+            {
+                "#": 5,
+                "街道": "翻前",
+                "简述": "加注到 160",
+                "动作代码": "raise",
+                "投入": 140,
+                "需跟": 20,
+                "底池前": 180,
+                "当前下注前": 40,
+                "当前下注后": 160,
+            }
+        ],
+    )
+
+    assert "推荐替代：弃牌" in html
+    assert "所需胜率" not in html
+    assert "赔率公式" not in html
+
+
+def test_review_cards_only_show_call_odds_for_a_calling_allin() -> None:
+    review = {
+        "sequence": 8,
+        "street": "turn",
+        "action": "all_in",
+        "rating": "可以接受",
+        "reason": "短码全下跟注。",
+        "pot_odds": 0.25,
+    }
+    calling_html = review_cards_html(
+        [review],
+        history=[
+            {
+                "#": 8,
+                "街道": "转牌",
+                "简述": "全下至 300",
+                "动作代码": "all_in",
+                "投入": 300,
+                "需跟": 400,
+                "底池前": 900,
+                "当前下注前": 400,
+                "当前下注后": 400,
+            }
+        ],
+    )
+    raising_html = review_cards_html(
+        [review],
+        history=[
+            {
+                "#": 8,
+                "街道": "转牌",
+                "简述": "全下至 1,200",
+                "动作代码": "all_in",
+                "投入": 1_080,
+                "需跟": 200,
+                "底池前": 900,
+                "当前下注前": 400,
+                "当前下注后": 1_200,
+            }
+        ],
+    )
+
+    assert "所需胜率 25.0%" in calling_html
+    assert "300 ÷（900 + 300）= 25.0%" in calling_html
+    assert "所需胜率" not in raising_html
+    assert "赔率公式" not in raising_html
+
+
+def test_review_cards_hide_allin_call_math_when_old_history_cannot_classify_it() -> None:
+    html = review_cards_html(
+        [
+            {
+                "sequence": 8,
+                "street": "turn",
+                "action": "all_in",
+                "rating": "偏松/偏紧",
+                "reason": "旧记录缺少全下分类字段。",
+                "pot_odds": 0.25,
+            }
+        ],
+        history=[
+            {
+                "#": 8,
+                "街道": "转牌",
+                "简述": "全下至 300",
+                "动作代码": "all_in",
+                "投入": 300,
+                "需跟": 400,
+                "底池前": 900,
+            }
+        ],
+    )
+
+    assert "所需胜率" not in html
+    assert "赔率公式" not in html
+
+
 def test_hero_net_result_uses_ending_stack_minus_initial_stack(six_seats) -> None:
     hand = HoldemHand(six_seats(), seed=7788)
     initial = hand.players["UTG"].stack

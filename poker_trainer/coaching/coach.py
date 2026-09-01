@@ -26,7 +26,7 @@ from poker_trainer.engine.models import (
 from .equity import analyze_common_draws, calculate_pot_odds, estimate_equity
 
 
-PREFLOP_HEURISTIC_VERSION = "6max-100bb-preflop-v2"
+PREFLOP_HEURISTIC_VERSION = "6max-100bb-preflop-v3"
 NOT_FULL_GTO_NOTICE = "MVP 为启发式离线教练，不是完整 GTO 求解器。"
 RANDOM_EQUITY_BASIS = "random_unknown_hands"
 
@@ -425,6 +425,32 @@ def _is_initial_sb_raise_response(context: CoachContext) -> bool:
     )
 
 
+def _weak_aggression_feedback(context: CoachContext) -> tuple[ActionRating, str]:
+    """弱牌先评价是否应主动投入，而不是先给出加注尺度。
+
+    尺度基准只回答“决定加注以后加多少”。当起手牌、位置和前序动作
+    已使主动加注本身不合适时，继续推荐一个更大的数字会误导新手。
+    """
+
+    snapshot = context.snapshot
+    limpers = _preflop_limp_count(context)
+    if snapshot.preflop_raise_count >= 1:
+        return (
+            ActionRating.CLEAR_ERROR,
+            "弱牌面对既有加注再次加注过松；应先收紧范围，而不是调整加注尺度。",
+        )
+    if limpers:
+        severe = snapshot.position in {Position.SB, Position.BB} or limpers >= 2
+        position_note = (
+            "位置较差、" if snapshot.position in {Position.SB, Position.BB} else ""
+        )
+        return (
+            ActionRating.CLEAR_ERROR if severe else ActionRating.LOOSE_OR_TIGHT,
+            f"弱牌隔离 {limpers} 名 limp 玩家过松：{position_note}又很难让偏松对手弃牌。",
+        )
+    return ActionRating.LOOSE_OR_TIGHT, "弱牌主动开池范围偏松，应优先弃牌。"
+
+
 def _review_preflop(context: CoachContext, record: ActionRecord) -> DecisionReview:
     snapshot = context.snapshot
     legal = context.legal_actions
@@ -473,62 +499,96 @@ def _review_preflop(context: CoachContext, record: ActionRecord) -> DecisionRevi
             recommended_action = "跟注"
         elif snapshot.preflop_raise_count == 0:
             rating, reason = ActionRating.LOOSE_OR_TIGHT, "弱牌 limp 容易被动，范围偏松。"
-            recommended_action = "弃牌或加注"
+            recommended_action = (
+                "弃牌；桌面极被动时可补齐"
+                if snapshot.position == Position.SB
+                else "弃牌或加注"
+            )
         else:
             rating, reason = ActionRating.CLEAR_ERROR, "弱牌面对加注继续过松。"
             recommended_action = "弃牌"
     elif _is_aggressive(record):
-        rating = (
-            ActionRating.RECOMMENDED
-            if bucket in {"premium", "strong"}
-            else ActionRating.ACCEPTABLE
-            if bucket == "playable"
-            else ActionRating.LOOSE_OR_TIGHT
+        limpers = _preflop_limp_count(context)
+        weak_range_error = bucket == "weak" and (
+            snapshot.preflop_raise_count >= 1 or limpers > 0
         )
-        reason = "主动加注与当前起手牌强度基本匹配。"
-        recommended_action = "加注" if bucket != "weak" else "弃牌"
-        reference_data = _preflop_raise_reference(context)
-        if reference_data is not None:
-            label, reference = reference_data
-            effective_max = _effective_max_to(context)
-            effective_to = _effective_bet_to(context, record)
-            can_use_normal_size = effective_max >= reference * 0.85
-            if label == "3bet" and can_use_normal_size:
-                codes.append(THREEBET_SIZING_OPPORTUNITY)
-            if can_use_normal_size:
-                lower_bound = 0.85 if label == "3bet" else 0.65 if label == "开池" else 0.75
-                upper_bound = 1.75 if label != "隔离加注" else 1.60
-                ratio = effective_to / reference
-                details.append(f"{label}参考中点约 {reference}，实际有效到 {effective_to}。")
-                recommended_action = f"加注到约 {reference}"
-                if ratio < lower_bound:
-                    codes.append(PREFLOP_RAISE_TOO_SMALL)
-                    if label == "3bet":
-                        codes.append(THREEBET_TOO_SMALL)
-                    rating = _worse(
-                        rating,
-                        ActionRating.CLEAR_ERROR
-                        if ratio < 0.60
-                        else ActionRating.LOOSE_OR_TIGHT,
+        if weak_range_error:
+            rating, reason = _weak_aggression_feedback(context)
+            if record.is_all_in:
+                rating = _worse(rating, ActionRating.CLEAR_ERROR)
+            recommended_action = "弃牌"
+            details.append(
+                "本次先评价起手牌、位置与前序动作；主动加注本身不合适，"
+                "因此不提供更大的加注尺度建议。"
+            )
+        else:
+            rating = (
+                ActionRating.RECOMMENDED
+                if bucket in {"premium", "strong"}
+                else ActionRating.ACCEPTABLE
+                if bucket == "playable"
+                else ActionRating.LOOSE_OR_TIGHT
+            )
+            if bucket == "weak":
+                reason = "弱牌开池属于位置敏感的边缘动作，范围不宜过宽。"
+                recommended_action = "弃牌或按标准尺度开池"
+            else:
+                reason = "主动加注与当前起手牌强度基本匹配。"
+                recommended_action = "加注"
+            reference_data = _preflop_raise_reference(context)
+            if reference_data is not None:
+                label, reference = reference_data
+                effective_max = _effective_max_to(context)
+                effective_to = _effective_bet_to(context, record)
+                can_use_normal_size = effective_max >= reference * 0.85
+                if label == "3bet" and can_use_normal_size:
+                    codes.append(THREEBET_SIZING_OPPORTUNITY)
+                if can_use_normal_size:
+                    lower_bound = (
+                        0.85
+                        if label == "3bet"
+                        else 0.65
+                        if label == "开池"
+                        else 0.75
                     )
-                    reason = (
-                        f"{label}到 {effective_to} 偏小，参考约 {reference}；"
-                        "过小会给多人便宜跟注。"
+                    upper_bound = 1.75 if label != "隔离加注" else 1.60
+                    ratio = effective_to / reference
+                    details.append(
+                        f"{label}参考中点约 {reference}，实际有效到 {effective_to}。"
                     )
-                elif ratio > upper_bound:
-                    codes.append(PREFLOP_RAISE_TOO_LARGE)
-                    if label == "3bet":
-                        codes.append(THREEBET_TOO_LARGE)
-                    rating = _worse(
-                        rating,
-                        ActionRating.CLEAR_ERROR
-                        if ratio >= 2.50
-                        else ActionRating.LOOSE_OR_TIGHT,
+                    recommended_action = (
+                        f"弃牌；若开池则加注到约 {reference}"
+                        if bucket == "weak"
+                        else f"加注到约 {reference}"
                     )
-                    reason = (
-                        f"{label}到 {effective_to} 偏大，参考约 {reference}；"
-                        "投入与可赢底池不成比例。"
-                    )
+                    if ratio < lower_bound:
+                        codes.append(PREFLOP_RAISE_TOO_SMALL)
+                        if label == "3bet":
+                            codes.append(THREEBET_TOO_SMALL)
+                        rating = _worse(
+                            rating,
+                            ActionRating.CLEAR_ERROR
+                            if ratio < 0.60
+                            else ActionRating.LOOSE_OR_TIGHT,
+                        )
+                        reason = (
+                            f"{label}到 {effective_to} 偏小，参考约 {reference}；"
+                            "过小会给多人便宜跟注。"
+                        )
+                    elif ratio > upper_bound:
+                        codes.append(PREFLOP_RAISE_TOO_LARGE)
+                        if label == "3bet":
+                            codes.append(THREEBET_TOO_LARGE)
+                        rating = _worse(
+                            rating,
+                            ActionRating.CLEAR_ERROR
+                            if ratio >= 2.50
+                            else ActionRating.LOOSE_OR_TIGHT,
+                        )
+                        reason = (
+                            f"{label}到 {effective_to} 偏大，参考约 {reference}；"
+                            "投入与可赢底池不成比例。"
+                        )
     else:
         rating, reason = ActionRating.ACCEPTABLE, "动作可接受。"
 
