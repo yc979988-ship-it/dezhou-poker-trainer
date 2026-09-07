@@ -122,6 +122,7 @@ class CoachContext:
     """一个不可变、无事后信息的动作前复盘快照。"""
 
     hand_id: str
+    hand_seed: int
     small_blind: int
     big_blind: int
     snapshot: DecisionSnapshot
@@ -146,6 +147,7 @@ class CoachContext:
         legal = self.legal_actions
         return {
             "hand_id": self.hand_id,
+            "hand_seed": self.hand_seed,
             "small_blind": self.small_blind,
             "big_blind": self.big_blind,
             "snapshot": {
@@ -268,6 +270,7 @@ def capture_context(hand: HoldemHand, player_id: str | None = None) -> CoachCont
     )
     return CoachContext(
         hand_id=hand.hand_id,
+        hand_seed=hand.seed,
         small_blind=hand.small_blind,
         big_blind=hand.big_blind,
         snapshot=snapshot,
@@ -318,7 +321,7 @@ def _equity_seed(context: CoachContext) -> int:
     snapshot = context.snapshot
     public_key = "|".join(
         (
-            context.hand_id,
+            str(context.hand_seed),
             str(snapshot.sequence),
             snapshot.player_id,
             snapshot.street.value,

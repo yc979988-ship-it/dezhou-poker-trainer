@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+import poker_trainer.ui.app as ui_app
 from poker_trainer.analytics.database import SQLiteStore
 from poker_trainer.analytics.statistics import (
     METRIC_ORDER,
@@ -27,7 +30,10 @@ from poker_trainer.engine.models import (
     Street,
 )
 from poker_trainer.engine.replay import ReplayBundle
+from poker_trainer.opponents.profiles import OpponentHabits
 from poker_trainer.ui.app import (
+    HABIT_LABELS_ZH,
+    OPPONENT_HABITS_FORMAT,
     POSITION_ORDER,
     action_history_rows,
     action_timeline_html,
@@ -39,6 +45,7 @@ from poker_trainer.ui.app import (
     format_hand_rank,
     format_metric,
     full_position_name,
+    habit_level_label,
     hand_public_view,
     hero_net_result,
     legal_action_controls,
@@ -47,6 +54,8 @@ from poker_trainer.ui.app import (
     load_saved_reviews,
     metric_detail_rows,
     normalize_reviews,
+    opponent_habits_from_json,
+    opponent_habits_to_json,
     rebuild_replay,
     replay_reviews_through_sequence,
     review_cards_html,
@@ -91,6 +100,39 @@ def _legal(**updates: object) -> LegalActions:
     }
     values.update(updates)
     return LegalActions(**values)  # type: ignore[arg-type]
+
+
+def _friend_habits(
+    number: int,
+    *,
+    opponent_id: str | None = None,
+    nickname: str | None = None,
+    **levels: int,
+) -> OpponentHabits:
+    values: dict[str, object] = {
+        "opponent_id": opponent_id or f"friend-{number}",
+        "nickname": nickname or f"牌友{number}",
+        "entry_frequency": 3,
+        "limp_frequency": 3,
+        "preflop_aggression": 3,
+        "calling_tendency": 3,
+        "postflop_aggression": 3,
+        "mistake_frequency": 2,
+    }
+    values.update(levels)
+    return OpponentHabits(**values)  # type: ignore[arg-type]
+
+
+def _habit_json_payload(
+    items: list[dict[str, object]],
+    *,
+    version: object = 1,
+    format_name: object = OPPONENT_HABITS_FORMAT,
+) -> str:
+    return json.dumps(
+        {"format": format_name, "version": version, "opponents": items},
+        ensure_ascii=False,
+    )
 
 
 def _reported_showdown_hand() -> object:
@@ -242,6 +284,259 @@ def test_position_names_keep_all_six_abbreviations_and_chinese_meanings() -> Non
     ]
 
 
+def test_habit_controls_use_plain_chinese_without_hidden_model_terms() -> None:
+    fields = (
+        "entry_frequency",
+        "limp_frequency",
+        "preflop_aggression",
+        "calling_tendency",
+        "postflop_aggression",
+        "mistake_frequency",
+    )
+    assert set(HABIT_LABELS_ZH) == set(fields)
+
+    visible_text = " ".join(str(HABIT_LABELS_ZH[field]) for field in fields)
+    for field in fields:
+        labels = [habit_level_label(field, level) for level in range(1, 6)]
+        assert len(set(labels)) == 5
+        assert all(any("\u4e00" <= char <= "\u9fff" for char in label) for label in labels)
+        visible_text += " " + " ".join(labels)
+
+    forbidden = (
+        "vpip",
+        "pfr",
+        "three_bet",
+        "fold_tendency",
+        "aggression_factor",
+    )
+    assert not any(term in visible_text.lower() for term in forbidden)
+    with pytest.raises((KeyError, ValueError)):
+        habit_level_label("unknown_habit", 3)
+    with pytest.raises((TypeError, ValueError)):
+        habit_level_label("entry_frequency", 0)
+
+
+def test_opponent_habit_json_is_versioned_and_round_trips_all_six_levels() -> None:
+    friends = (
+        _friend_habits(
+            1,
+            nickname="阿杰",
+            entry_frequency=5,
+            limp_frequency=4,
+            preflop_aggression=2,
+            calling_tendency=5,
+            postflop_aggression=1,
+            mistake_frequency=3,
+        ),
+        _friend_habits(
+            2,
+            nickname="老周",
+            entry_frequency=2,
+            limp_frequency=1,
+            preflop_aggression=5,
+            calling_tendency=2,
+            postflop_aggression=4,
+            mistake_frequency=1,
+        ),
+    )
+
+    encoded = opponent_habits_to_json(friends)
+    payload = json.loads(encoded)
+    assert payload["format"] == OPPONENT_HABITS_FORMAT
+    assert payload["version"] == 1
+    assert len(payload["opponents"]) == 2
+    assert set(payload["opponents"][0]) == {
+        "opponent_id",
+        "nickname",
+        "entry_frequency",
+        "limp_frequency",
+        "preflop_aggression",
+        "calling_tendency",
+        "postflop_aggression",
+        "mistake_frequency",
+    }
+    assert tuple(opponent_habits_from_json(encoded)) == friends
+
+    hidden_terms = (
+        "vpip",
+        "pfr",
+        "three_bet",
+        "fold_tendency",
+        "aggression_factor",
+    )
+    assert not any(term in encoded.lower() for term in hidden_terms)
+
+
+def test_opponent_habit_json_limits_roster_to_five_on_export_and_import() -> None:
+    six_friends = tuple(_friend_habits(number) for number in range(1, 7))
+    with pytest.raises(ValueError, match="5|五|最多"):
+        opponent_habits_to_json(six_friends)
+
+    payload = _habit_json_payload([friend.as_dict() for friend in six_friends])
+    with pytest.raises(ValueError, match="5|五|最多"):
+        opponent_habits_from_json(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("opponent_id", ""),
+        ("nickname", "  "),
+        ("entry_frequency", 0),
+        ("limp_frequency", 6),
+        ("preflop_aggression", 2.5),
+        ("calling_tendency", True),
+        ("postflop_aggression", "3"),
+        ("mistake_frequency", -1),
+    ),
+)
+def test_opponent_habit_json_rejects_empty_identity_and_bad_levels(
+    field: str,
+    value: object,
+) -> None:
+    item = _friend_habits(1).as_dict()
+    item[field] = value
+    with pytest.raises((TypeError, ValueError)):
+        opponent_habits_from_json(_habit_json_payload([item]))
+
+
+def test_opponent_habit_json_rejects_duplicate_ids_and_trimmed_nicknames() -> None:
+    first = _friend_habits(1, opponent_id="friend-a", nickname="阿杰")
+    duplicate_id = _friend_habits(2, opponent_id="friend-a", nickname="老周")
+    duplicate_name = _friend_habits(3, opponent_id="friend-c", nickname=" 阿杰 ")
+
+    with pytest.raises(ValueError, match="重复|不能相同"):
+        opponent_habits_to_json((first, duplicate_id))
+    with pytest.raises(ValueError, match="重复|不能相同"):
+        opponent_habits_from_json(
+            _habit_json_payload([first.as_dict(), duplicate_name.as_dict()])
+        )
+
+
+def test_opponent_habit_json_rejects_unknown_version() -> None:
+    payload = _habit_json_payload([_friend_habits(1).as_dict()], version=2)
+    with pytest.raises(ValueError, match="版本|version|1"):
+        opponent_habits_from_json(payload)
+
+
+@pytest.mark.parametrize("bad_version", (True, 1.0, "1", None))
+def test_opponent_habit_json_rejects_non_integer_version(
+    bad_version: object,
+) -> None:
+    payload = _habit_json_payload(
+        [_friend_habits(1).as_dict()], version=bad_version
+    )
+    with pytest.raises(ValueError, match="版本"):
+        opponent_habits_from_json(payload)
+
+
+def test_opponent_habit_json_rejects_wrong_format_and_oversized_input() -> None:
+    wrong_format = _habit_json_payload(
+        [_friend_habits(1).as_dict()], format_name="another-app"
+    )
+    with pytest.raises(ValueError, match="德州训练器"):
+        opponent_habits_from_json(wrong_format)
+    with pytest.raises(ValueError, match="64KB"):
+        opponent_habits_from_json(" " * (64 * 1024 + 1))
+
+
+def test_opponent_habit_json_accepts_utf8_bom_and_rejects_bad_schema() -> None:
+    friend = _friend_habits(1)
+    assert opponent_habits_from_json(
+        "\ufeff" + _habit_json_payload([friend.as_dict()])
+    ) == (friend,)
+
+    missing = friend.as_dict()
+    missing.pop("calling_tendency")
+    unknown = friend.as_dict() | {"vpip": 0.9}
+    for row in (missing, unknown):
+        with pytest.raises(ValueError, match="字段|无效"):
+            opponent_habits_from_json(_habit_json_payload([row]))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("opponent_id", None),
+        ("nickname", None),
+        ("nickname", "牌友\n甲"),
+        ("nickname", "这是一位昵称特别特别特别特别长的牌友"),
+    ),
+)
+def test_opponent_habit_json_rejects_unsafe_identity_values(
+    field: str, value: object
+) -> None:
+    item = _friend_habits(1).as_dict()
+    item[field] = value
+    with pytest.raises(ValueError):
+        opponent_habits_from_json(_habit_json_payload([item]))
+
+
+def test_web_sessions_get_distinct_default_databases(monkeypatch, tmp_path) -> None:
+    base_path = tmp_path / "poker_trainer.sqlite3"
+    monkeypatch.setattr(ui_app, "_CONFIGURED_DB_PATH", None)
+    monkeypatch.setattr(ui_app, "DEFAULT_DB_PATH", base_path)
+
+    first = ui_app._new_web_session_db_path()
+    second = ui_app._new_web_session_db_path()
+
+    assert first != second
+    assert first.parent == second.parent == tmp_path
+    assert "-session-" in first.name and first.suffix == ".sqlite3"
+
+    monkeypatch.setattr(ui_app, "_CONFIGURED_DB_PATH", str(base_path))
+    assert ui_app._new_web_session_db_path() == base_path
+
+
+def test_import_reset_clears_only_stale_opponent_form_widgets() -> None:
+    state = {
+        "opponent_habits": ("keep",),
+        "opponent_habits_upload": "keep-upload",
+        "opponent_nickname_friend-a": "旧昵称",
+        "opponent_entry_frequency_friend-a": "偏少",
+        "opponent_calling_tendency_friend-a": "偏爱跟",
+        "nav": "设置",
+    }
+    fake_streamlit = SimpleNamespace(session_state=state)
+
+    ui_app._clear_opponent_form_widgets(fake_streamlit)
+
+    assert state == {
+        "opponent_habits": ("keep",),
+        "opponent_habits_upload": "keep-upload",
+        "nav": "设置",
+    }
+
+
+def test_seat_grid_escapes_untrusted_friend_nickname() -> None:
+    malicious_name = '<script>alert("x")</script><b>牌友</b>'
+    view = {
+        "current_actor_id": None,
+        "street_name": "翻前",
+        "history": [],
+        "seats": [
+            {
+                "player_id": "friend-unsafe",
+                "position": Position.HJ,
+                "position_name": "HJ（中位）",
+                "name": malicious_name,
+                "stack": 4_000,
+                "folded": False,
+                "all_in": False,
+                "is_hero": False,
+                "cards": (),
+                "cards_hidden": True,
+            }
+        ],
+    }
+
+    html = seat_grid_html(view)
+    assert malicious_name not in html
+    assert "<script>" not in html and "<b>" not in html
+    assert "&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;" in html
+    assert "&lt;b&gt;牌友&lt;/b&gt;" in html
+
+
 def test_chip_and_card_formatting_is_mobile_friendly() -> None:
     assert format_chips(4_000) == "4,000 筹码（¥40.00）"
     assert format_chips(60) == "60 筹码（¥0.60）"
@@ -324,6 +619,22 @@ def test_public_hand_view_hides_running_opponent_cards_and_no_profile_fields(six
     } & public_keys
 
 
+def test_public_hand_view_applies_names_only_as_a_display_overlay(six_seats) -> None:
+    hand = HoldemHand(six_seats(), seed=20260907)
+    original_name = hand.player("HJ").name
+
+    view = hand_public_view(
+        hand,
+        "UTG",
+        display_names={"HJ": "阿杰"},
+    )
+
+    hj = next(row for row in view["seats"] if row["player_id"] == "HJ")
+    assert hj["name"] == "阿杰"
+    assert hand.player("HJ").name == original_name
+    assert "阿杰" not in repr(hand.public_view("UTG"))
+
+
 def test_public_hand_view_reveals_live_hands_only_after_showdown(six_seats) -> None:
     hand = HoldemHand(six_seats(), seed=77)
     _play_passively(hand)
@@ -375,6 +686,20 @@ def test_reported_showdown_rows_and_summary_name_the_actual_winner() -> None:
     assert "获得 1,120 筹码" in summary
     assert "你的牌型是两对 10 和 6（Q 踢脚）" in summary
     assert "本手未获得底池" in summary
+
+
+def test_showdown_helpers_apply_the_same_temporary_name_overlay() -> None:
+    hand = _reported_showdown_hand()
+    names = {"SB": "阿杰"}
+
+    pots = result_pot_rows(hand, display_names=names)
+    rows = showdown_rank_rows(hand, display_names=names)
+    summary = settlement_summary(hand, "BB", display_names=names)
+
+    assert "SB（小盲） · 阿杰" in pots[0]["赢家"]
+    assert any(row["玩家"] == "SB（小盲） · 阿杰" for row in rows)
+    assert "SB（小盲） · 阿杰" in summary
+    assert getattr(hand, "players")["SB"].name == "对手5"
 
 
 def test_main_and_side_pot_rows_name_each_winner_and_summary_lists_both() -> None:

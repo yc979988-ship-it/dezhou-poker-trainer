@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from poker_trainer.opponents.profiles import OpponentProfile
 
 
-POLICY_VERSION = "opponent-policy-v3"
+POLICY_VERSION = "opponent-policy-v4"
 _MONTE_CARLO_TRIALS = 56
 
 
@@ -268,7 +268,6 @@ def _named_rng(
     for value in (
         POLICY_VERSION,
         policy_seed,
-        context.hand_id,
         context.hand_seed,
         context.sequence,
         context.player_id,

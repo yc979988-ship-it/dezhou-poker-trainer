@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+import poker_trainer.coaching.coach as coach_module
 from poker_trainer.coaching.coach import (
     ActionRating,
     DRAW_ODDS_ERROR,
@@ -46,6 +47,23 @@ def _button_raises_and_bb_calls(hand: HoldemHand) -> None:
     _act(hand, "SB", ActionType.FOLD)
     _act(hand, "BB", ActionType.CALL)
     assert hand.current_actor_id == "BB"
+
+
+def test_equity_seed_uses_hand_seed_not_random_storage_id(six_seats) -> None:
+    first = HoldemHand(
+        six_seats(), seed=20260907, hand_id="random-session-a-hand-1"
+    )
+    second = HoldemHand(
+        six_seats(), seed=20260907, hand_id="random-session-b-hand-1"
+    )
+
+    first_context = capture_context(first, "UTG")
+    second_context = capture_context(second, "UTG")
+
+    assert first_context.hand_seed == second_context.hand_seed == 20260907
+    assert coach_module._equity_seed(first_context) == coach_module._equity_seed(
+        second_context
+    )
 
 
 def _draw_decision(six_seats, *, seed: int) -> HoldemHand:

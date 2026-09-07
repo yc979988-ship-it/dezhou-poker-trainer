@@ -59,6 +59,12 @@ div[role="radiogroup"] label {
   display: inline-flex;
   align-items: center;
 }
+div[data-testid="stExpander"] summary,
+div[data-testid="stTextInput"] input,
+div[data-testid="stSelectbox"] div[data-baseweb="select"] > div,
+div[data-testid="stFileUploaderDropzone"] {
+  min-height: 46px;
+}
 div[data-testid="stButton"] > button[kind="primary"],
 div[data-testid="stFormSubmitButton"] > button[kind="primary"] {
   background: var(--felt);

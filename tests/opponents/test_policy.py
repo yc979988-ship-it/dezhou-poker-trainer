@@ -95,6 +95,26 @@ def test_policy_is_deterministic_and_does_not_touch_any_rng_or_deck(six_seats) -
     assert random.getstate() == global_state_before
 
 
+def test_policy_random_stream_does_not_depend_on_storage_hand_id(six_seats) -> None:
+    first_hand = HoldemHand(
+        six_seats(),
+        seed=20260907,
+        hand_id="random-session-a-hand-1",
+    )
+    second_hand = HoldemHand(
+        six_seats(),
+        seed=20260907,
+        hand_id="random-session-b-hand-1",
+    )
+    first_context = PolicyContext.from_hand(first_hand, "UTG")
+    second_context = PolicyContext.from_hand(second_hand, "UTG")
+
+    first = OpponentPolicy.choose(first_context, profile(), policy_seed=8765)
+    second = OpponentPolicy.choose(second_context, profile(), policy_seed=8765)
+
+    assert first == second
+
+
 def test_high_three_bet_profile_reraises_where_low_profile_does_not(six_seats) -> None:
     hand = HoldemHand(
         six_seats(),
@@ -136,9 +156,9 @@ def test_medium_suited_hand_can_flat_three_bb_but_folds_to_larger_open(
         hand.act("UTG", ActionType.RAISE, open_to)
         context = PolicyContext.from_hand(hand, "HJ")
         decision = OpponentPolicy.choose(
-            context,
-            profile("HJ", vpip=0.50, pfr=0.16, fold_tendency=0.48),
-            policy_seed=0,
+                context,
+                profile("HJ", vpip=0.50, pfr=0.16, fold_tendency=0.48),
+                policy_seed=2,
         )
         return decision.action
 

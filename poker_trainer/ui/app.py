@@ -7,12 +7,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from poker_trainer.analytics.statistics import (
     METRIC_LABELS_ZH,
@@ -22,6 +24,7 @@ from poker_trainer.analytics.statistics import (
 from poker_trainer.engine.evaluator import HandCategory, HandRank, evaluate
 from poker_trainer.engine.models import ActionType, Position, Street
 from poker_trainer.engine.replay import ReplayBundle
+from poker_trainer.opponents.profiles import OpponentHabits
 
 from .styles import apply_styles
 
@@ -29,13 +32,34 @@ from .styles import apply_styles
 APP_TITLE = "德州扑克自适应训练器"
 PRODUCT_NOTICE = "离线模拟 · 不做真实牌局实时读屏 · MVP 不是完整 GTO 求解器"
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CONFIGURED_DB_PATH = os.getenv("POKER_TRAINER_DB_PATH")
 DEFAULT_DB_PATH = Path(
-    os.getenv(
-        "POKER_TRAINER_DB_PATH",
-        str(_PROJECT_ROOT / "data" / "poker_trainer.sqlite3"),
-    )
+    _CONFIGURED_DB_PATH
+    or str(_PROJECT_ROOT / "data" / "poker_trainer.sqlite3")
 )
 CHIPS_PER_YUAN = 100
+OPPONENT_HABITS_FORMAT = "poker-trainer-opponents"
+OPPONENT_HABITS_FORMAT_VERSION = 1
+_MAX_OPPONENT_HABITS_JSON_BYTES = 64 * 1024
+
+HABIT_LABELS_ZH: dict[str, tuple[str, ...]] = {
+    "entry_frequency": ("很少入池", "偏少", "一般", "偏多", "很多"),
+    "limp_frequency": ("几乎不 limp", "偏少", "一般", "偏多", "经常 limp"),
+    "preflop_aggression": ("几乎不主动", "偏被动", "一般", "偏主动", "很爱加注"),
+    "calling_tendency": ("很容易弃牌", "偏容易弃", "看牌决定", "偏爱跟", "很爱跟"),
+    "postflop_aggression": ("很被动", "偏被动", "一般", "偏主动", "很激进"),
+    "mistake_frequency": ("很少", "偏少", "偶尔", "偏多", "经常乱打"),
+}
+
+
+def _new_web_session_db_path() -> Path:
+    """默认让每个网页会话使用独立 SQLite，避免公网访客互看回放。"""
+
+    if _CONFIGURED_DB_PATH:
+        return DEFAULT_DB_PATH
+    return DEFAULT_DB_PATH.with_name(
+        f"{DEFAULT_DB_PATH.stem}-session-{uuid4().hex}{DEFAULT_DB_PATH.suffix}"
+    )
 
 POSITION_ORDER: tuple[Position, ...] = (
     Position.UTG,
@@ -119,6 +143,95 @@ def format_percentage(value: float | None, *, digits: int = 1) -> str:
     if value is None:
         return "信号不足"
     return f"{float(value) * 100:.{digits}f}%"
+
+
+def habit_level_label(field_name: str, level: int) -> str:
+    """把 1..5 级观察值显示成口语中文，不展示内部概率。"""
+
+    try:
+        labels = HABIT_LABELS_ZH[field_name]
+    except KeyError as exc:
+        raise ValueError(f"未知习惯字段: {field_name}") from exc
+    if isinstance(level, bool) or not isinstance(level, int) or not 1 <= level <= 5:
+        raise ValueError("习惯等级必须在 1 到 5 之间")
+    return labels[level - 1]
+
+
+def _habit_level_from_label(field_name: str, label: str) -> int:
+    try:
+        return HABIT_LABELS_ZH[field_name].index(label) + 1
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"无效的习惯选项: {field_name}={label}") from exc
+
+
+def _normalise_opponent_habits(
+    habits: Iterable[OpponentHabits],
+) -> tuple[OpponentHabits, ...]:
+    try:
+        values = tuple(habits)
+    except TypeError as exc:
+        raise TypeError("牌友档案必须是序列") from exc
+    if len(values) > 5:
+        raise ValueError("一桌最多录入 5 名常用牌友")
+    if any(not isinstance(item, OpponentHabits) for item in values):
+        raise TypeError("牌友档案只能包含 OpponentHabits")
+    ids = [item.opponent_id for item in values]
+    names = [item.nickname.casefold() for item in values]
+    if len(set(ids)) != len(ids):
+        raise ValueError("牌友档案 ID 不能重复")
+    if len(set(names)) != len(names):
+        raise ValueError("牌友昵称不能重复")
+    return values
+
+
+def opponent_habits_to_json(habits: Iterable[OpponentHabits]) -> str:
+    """导出仅含昵称与观察等级的可移植 JSON，不写入隐藏参数。"""
+
+    values = _normalise_opponent_habits(habits)
+    return json.dumps(
+        {
+            "format": OPPONENT_HABITS_FORMAT,
+            "version": OPPONENT_HABITS_FORMAT_VERSION,
+            "opponents": [item.as_dict() for item in values],
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def opponent_habits_from_json(text: str) -> tuple[OpponentHabits, ...]:
+    """校验并读取牌友档案备份；未知版本会明确拒绝。"""
+
+    if not isinstance(text, str):
+        raise TypeError("牌友档案 JSON 必须是文本")
+    if len(text.encode("utf-8")) > _MAX_OPPONENT_HABITS_JSON_BYTES:
+        raise ValueError("牌友档案超过 64KB，无法导入")
+    text = text.removeprefix("\ufeff")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("牌友档案不是有效 JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise ValueError("牌友档案顶层必须是对象")
+    if set(payload) != {"format", "version", "opponents"}:
+        raise ValueError("牌友档案顶层字段不完整或含未知字段")
+    if payload.get("format") != OPPONENT_HABITS_FORMAT:
+        raise ValueError("不是德州训练器牌友档案")
+    version = payload.get("version")
+    if (
+        type(version) is not int
+        or version != OPPONENT_HABITS_FORMAT_VERSION
+    ):
+        raise ValueError("不支持的牌友档案版本")
+    rows = payload.get("opponents")
+    if not isinstance(rows, list):
+        raise ValueError("牌友档案缺少 opponents 列表")
+    try:
+        habits = tuple(OpponentHabits.from_mapping(row) for row in rows)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"牌友档案内容无效：{exc}") from exc
+    return _normalise_opponent_habits(habits)
 
 
 _SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
@@ -379,13 +492,20 @@ def _player_map(hand: Any) -> dict[str, Any]:
     }
 
 
-def _player_label(players: Mapping[str, Any], player_id: str) -> str:
+def _player_label(
+    players: Mapping[str, Any],
+    player_id: str,
+    display_names: Mapping[str, str] | None = None,
+) -> str:
     player = players.get(player_id)
     if player is None:
         return player_id
+    display_name = (display_names or {}).get(
+        player_id, str(_read(player, "name", player_id))
+    )
     return (
         f"{full_position_name(_read(player, 'position'))} · "
-        f"{_read(player, 'name', player_id)}"
+        f"{display_name}"
     )
 
 
@@ -418,7 +538,11 @@ def _evaluated_showdown_ranks(hand: Any) -> dict[str, HandRank]:
     return ranks
 
 
-def result_pot_rows(hand: Any) -> list[dict[str, Any]]:
+def result_pot_rows(
+    hand: Any,
+    *,
+    display_names: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """生成公开的主池/边池结算明细，不暴露任何隐藏画像。"""
 
     result = _read(hand, "result")
@@ -448,18 +572,24 @@ def result_pot_rows(hand: Any) -> list[dict[str, Any]]:
                 "底池": "主池" if index == 0 else f"边池 {index}",
                 "金额": format_chips(int(_read(pot, "amount", 0) or 0)),
                 "赢家": "、".join(
-                    _player_label(players, player_id) for player_id in winners
+                    _player_label(players, player_id, display_names)
+                    for player_id in winners
                 )
                 or "待确认",
                 "可争夺玩家": "、".join(
-                    _player_label(players, player_id) for player_id in eligible
+                    _player_label(players, player_id, display_names)
+                    for player_id in eligible
                 ),
             }
         )
     return rows
 
 
-def showdown_rank_rows(hand: Any) -> list[dict[str, Any]]:
+def showdown_rank_rows(
+    hand: Any,
+    *,
+    display_names: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
     """生成摊牌牌型与派奖表；弃牌玩家不会出现在牌型映射中。"""
 
     result = _read(hand, "result")
@@ -487,7 +617,7 @@ def showdown_rank_rows(hand: Any) -> list[dict[str, Any]]:
                 "结果": "赢家"
                 if int(payouts.get(player_id, 0) or 0) > 0
                 else "未获底池",
-                "玩家": _player_label(players, player_id),
+                "玩家": _player_label(players, player_id, display_names),
                 "牌型": format_hand_rank(rank if rank is not None else fallback_rank),
                 "最佳五张": format_cards(rank.best_five) if rank is not None else "—",
                 "获得": format_chips(int(payouts.get(player_id, 0) or 0)),
@@ -496,7 +626,12 @@ def showdown_rank_rows(hand: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def settlement_summary(hand: Any, hero_id: str) -> str:
+def settlement_summary(
+    hand: Any,
+    hero_id: str,
+    *,
+    display_names: Mapping[str, str] | None = None,
+) -> str:
     """常显赢家、牌型与英雄牌型，避免把“英雄收回 0”误读为无人获奖。"""
 
     result = _read(hand, "result")
@@ -516,7 +651,11 @@ def settlement_summary(hand: Any, hero_id: str) -> str:
     )
     winner_parts: list[str] = []
     for player_id, payout in winners:
-        label = "你" if player_id == hero_id else _player_label(players, player_id)
+        label = (
+            "你"
+            if player_id == hero_id
+            else _player_label(players, player_id, display_names)
+        )
         rank = ranks.get(player_id)
         hand_text = f"以{format_hand_rank(rank)}" if rank is not None else ""
         winner_parts.append(f"{label}{hand_text}获得 {payout:,} 筹码")
@@ -538,6 +677,7 @@ def hand_public_view(
     hero_id: str,
     *,
     reveal_showdown: bool = True,
+    display_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """组装安全界面快照：对手底牌只在合法摊牌时显示。"""
 
@@ -584,7 +724,11 @@ def hand_public_view(
                 "position": position,
                 "position_name": full_position_name(position),
                 "player_id": player_id,
-                "name": str(_read(player, "name", player_id)),
+                "name": str(
+                    (display_names or {}).get(
+                        player_id, _read(player, "name", player_id)
+                    )
+                ),
                 "stack": int(_read(player, "stack", 0) or 0),
                 "folded": folded,
                 "all_in": bool(_read(player, "all_in", False)),
@@ -1151,11 +1295,33 @@ def _rerun(st: Any) -> None:
     rerun()
 
 
+def _clear_opponent_form_widgets(st: Any) -> None:
+    prefixes = (
+        "opponent_nickname_",
+        "opponent_entry_frequency_",
+        "opponent_limp_frequency_",
+        "opponent_preflop_aggression_",
+        "opponent_calling_tendency_",
+        "opponent_postflop_aggression_",
+        "opponent_mistake_frequency_",
+    )
+    for key in tuple(st.session_state):
+        if str(key).startswith(prefixes):
+            del st.session_state[key]
+
+
 def _mode_key(trainer: Any) -> str:
     return str(_value(_read(trainer, "mode", "test"))).strip().lower()
 
 
-def _create_training_session(*, mode: str, seed: int, auto_top_up: bool, db_path: Path) -> Any:
+def _create_training_session(
+    *,
+    mode: str,
+    seed: int,
+    auto_top_up: bool,
+    db_path: Path,
+    opponent_habits: Iterable[OpponentHabits] = (),
+) -> Any:
     """延迟导入会话层，保持纯 helper 不依赖完整应用环境。"""
 
     from poker_trainer.training.session import SessionConfig, TrainingSession
@@ -1168,6 +1334,7 @@ def _create_training_session(*, mode: str, seed: int, auto_top_up: bool, db_path
         big_blind=40,
         buy_in=4000,
         chips_per_yuan=CHIPS_PER_YUAN,
+        opponent_habits=_normalise_opponent_habits(opponent_habits),
     )
     trainer = TrainingSession(config=config, db_path=db_path)
     trainer.start_hand()
@@ -1183,8 +1350,164 @@ def _notice_html() -> str:
     )
 
 
+def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
+    """录入当前网页会话使用的常用牌友，未满五人时随机补位。"""
+
+    if st.session_state.pop("_reset_opponent_form_widgets", False):
+        _clear_opponent_form_widgets(st)
+    habits = _normalise_opponent_habits(
+        st.session_state.get("opponent_habits", ())
+    )
+    flash = st.session_state.pop("_opponent_flash", None)
+    st.markdown("#### 常用牌友（可选）")
+    if flash:
+        st.success(str(flash))
+    st.caption(
+        "最多 5 人，只建议填昵称。这里记录的是你观察到的起点，不是永久标签；"
+        "每个训练场次仍会小幅变化。"
+    )
+    if habits:
+        st.write("本桌加入：" + "、".join(item.nickname for item in habits))
+    else:
+        st.caption("目前未录入，本桌将使用 5 名随机对手。")
+
+    if st.button(
+        "＋ 新增一位牌友",
+        disabled=len(habits) >= 5,
+        width="stretch",
+        key="add_opponent_habit",
+    ):
+        used_names = {item.nickname.casefold() for item in habits}
+        number = 1
+        while f"牌友{number}".casefold() in used_names:
+            number += 1
+        new_habits = OpponentHabits(
+            opponent_id=f"friend-{uuid4().hex}",
+            nickname=f"牌友{number}",
+        )
+        st.session_state["opponent_habits"] = (*habits, new_habits)
+        st.session_state["_open_opponent_id"] = new_habits.opponent_id
+        _rerun(st)
+
+    questions = (
+        ("entry_frequency", "翻前有多常入池？"),
+        ("limp_frequency", "有多常只跟大盲入池（limp）？"),
+        ("preflop_aggression", "翻前有多爱主动加注或再加注？"),
+        ("calling_tendency", "面对别人下注或加注，有多爱继续？"),
+        ("postflop_aggression", "翻后有多爱主动下注或加注？"),
+        ("mistake_frequency", "有多常出现非标准操作或明显失误？"),
+    )
+    open_id = st.session_state.pop("_open_opponent_id", None)
+    for item in habits:
+        with st.expander(
+            f"{item.nickname} · 点击设置习惯",
+            expanded=item.opponent_id == open_id,
+        ):
+            with st.form(f"opponent_habits_{item.opponent_id}"):
+                nickname = st.text_input(
+                    "昵称",
+                    value=item.nickname,
+                    max_chars=16,
+                    help="建议使用代号，不要填写真实姓名。",
+                    key=f"opponent_nickname_{item.opponent_id}",
+                )
+                levels: dict[str, int] = {}
+                for field_name, question in questions:
+                    chosen = st.selectbox(
+                        question,
+                        HABIT_LABELS_ZH[field_name],
+                        index=int(getattr(item, field_name)) - 1,
+                        key=f"opponent_{field_name}_{item.opponent_id}",
+                    )
+                    levels[field_name] = _habit_level_from_label(
+                        field_name, str(chosen)
+                    )
+                save_clicked = st.form_submit_button(
+                    "保存这位牌友",
+                    type="primary",
+                    width="stretch",
+                )
+                remove_clicked = st.form_submit_button(
+                    "移除这位牌友",
+                    width="stretch",
+                )
+
+            if remove_clicked:
+                st.session_state["opponent_habits"] = tuple(
+                    row for row in habits if row.opponent_id != item.opponent_id
+                )
+                st.session_state["_opponent_flash"] = f"已移除 {item.nickname}"
+                _rerun(st)
+            if save_clicked:
+                try:
+                    updated = OpponentHabits(
+                        opponent_id=item.opponent_id,
+                        nickname=nickname,
+                        **levels,
+                    )
+                    replaced = tuple(
+                        updated if row.opponent_id == item.opponent_id else row
+                        for row in habits
+                    )
+                    _normalise_opponent_habits(replaced)
+                except (TypeError, ValueError) as exc:
+                    st.error(f"无法保存：{exc}")
+                else:
+                    st.session_state["opponent_habits"] = replaced
+                    st.session_state["_opponent_flash"] = f"已保存 {updated.nickname}"
+                    _rerun(st)
+
+    with st.expander("备份或恢复牌友档案", expanded=False):
+        st.caption(
+            "档案默认只留在当前打开的网页会话；云端重启或刷新可能清空。"
+            "下载 JSON 后可随时恢复。"
+        )
+        st.download_button(
+            "下载牌友档案",
+            data=opponent_habits_to_json(habits),
+            file_name="德州训练器-牌友档案.json",
+            mime="application/json",
+            width="stretch",
+        )
+        uploaded = st.file_uploader(
+            "从 JSON 恢复",
+            type=("json",),
+            max_upload_size=1,
+            key="opponent_habits_upload",
+        )
+        if st.button(
+            "导入所选档案",
+            disabled=uploaded is None,
+            width="stretch",
+            key="import_opponent_habits",
+        ):
+            try:
+                uploaded_size = getattr(uploaded, "size", None)
+                if (
+                    uploaded_size is not None
+                    and int(uploaded_size) > _MAX_OPPONENT_HABITS_JSON_BYTES
+                ):
+                    raise ValueError("牌友档案超过 64KB，无法导入")
+                raw_bytes = uploaded.getvalue()
+                if len(raw_bytes) > _MAX_OPPONENT_HABITS_JSON_BYTES:
+                    raise ValueError("牌友档案超过 64KB，无法导入")
+                raw = raw_bytes.decode("utf-8-sig")
+                imported = opponent_habits_from_json(raw)
+            except (AttributeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+                st.error(f"导入失败：{exc}")
+            else:
+                st.session_state["opponent_habits"] = imported
+                st.session_state["_reset_opponent_form_widgets"] = True
+                st.session_state["_opponent_flash"] = (
+                    f"已导入 {len(imported)} 位牌友"
+                )
+                _rerun(st)
+    return habits
+
+
 def _render_setup(st: Any) -> None:
     st.subheader("训练设置")
+    opponent_habits = _render_opponent_setup(st)
     with st.form("session_settings"):
         mode_label = st.selectbox(
             "模式",
@@ -1220,6 +1543,7 @@ def _render_setup(st: Any) -> None:
                 seed=int(seed),
                 auto_top_up=bool(auto_top_up),
                 db_path=Path(st.session_state["db_path"]),
+                opponent_habits=opponent_habits,
             )
         except Exception as exc:
             st.error(f"创建训练场次失败：{exc}")
@@ -1382,6 +1706,7 @@ def _render_result(st: Any, trainer: Any, hand: Any) -> None:
     if result is None:
         return
     hero_id = str(_read(trainer, "hero_id", "hero"))
+    display_names = _read(trainer, "opponent_display_names", {}) or {}
     payout = int((_read(result, "payouts", {}) or {}).get(hero_id, 0))
     net = hero_net_result(hand, hero_id)
     big_blind = max(1, int(_read(hand, "big_blind", 40) or 40))
@@ -1398,15 +1723,19 @@ def _render_result(st: Any, trainer: Any, hand: Any) -> None:
         f"你的结算：投入 {invested:,} 筹码 · 从底池获得 {payout:,} 筹码 · "
         f"净结果 {net:+,}"
     )
-    summary = settlement_summary(hand, hero_id)
+    summary = settlement_summary(
+        hand, hero_id, display_names=display_names
+    )
     if summary:
         st.info(summary)
 
-    pot_rows = result_pot_rows(hand)
+    pot_rows = result_pot_rows(hand, display_names=display_names)
     if pot_rows:
         with st.expander("查看主池、赢家与最佳五张", expanded=len(pot_rows) > 1):
             st.dataframe(pot_rows, width="stretch", hide_index=True)
-            rank_rows = showdown_rank_rows(hand)
+            rank_rows = showdown_rank_rows(
+                hand, display_names=display_names
+            )
             if rank_rows:
                 st.dataframe(rank_rows, width="stretch", hide_index=True)
 
@@ -1465,7 +1794,12 @@ def _render_training(st: Any) -> None:
             st.error(f"对手行动失败：{exc}")
             return
 
-    view = hand_public_view(hand, hero_id)
+    display_names = _read(trainer, "opponent_display_names", {}) or {}
+    view = hand_public_view(
+        hand,
+        hero_id,
+        display_names=display_names,
+    )
     mode_name = "教学模式" if _mode_key(trainer) in {"teaching", "teach", "教学", "教学模式"} else "测试模式"
     st.subheader(f"第 {view['hand_no']} 手 · {mode_name}")
     st.caption(f"手牌 seed：{view['seed']} · 20/40 · 100bb")
@@ -1593,7 +1927,10 @@ def _hand_option_label(row: Mapping[str, Any]) -> str:
 
 def _render_replay(st: Any) -> None:
     st.subheader("确定性回放")
-    st.caption("回放直接使用 SQLite 中的洗牌 seed、牌序和动作日志，不重新采样对手决策。")
+    st.caption(
+        "回放直接使用当前网页会话 SQLite 中的洗牌 seed、牌序和动作日志，"
+        "不重新采样对手决策；默认不会显示其他访客的记录。"
+    )
     db_path = Path(st.session_state["db_path"])
     try:
         hands = list_saved_hands(db_path)
@@ -1750,7 +2087,9 @@ def main() -> None:
     apply_styles(st)
     st.session_state.setdefault("trainer", None)
     st.session_state.setdefault("latest_reviews", ())
-    st.session_state.setdefault("db_path", str(DEFAULT_DB_PATH))
+    st.session_state.setdefault("opponent_habits", ())
+    if "db_path" not in st.session_state:
+        st.session_state["db_path"] = str(_new_web_session_db_path())
     st.session_state.setdefault("nav", "设置")
     next_nav = st.session_state.pop("_next_nav", None)
     if next_nav in {"设置", "训练", "统计", "回放"}:
@@ -1785,6 +2124,9 @@ __all__ = [
     "BetToRange",
     "CHIPS_PER_YUAN",
     "DEFAULT_DB_PATH",
+    "HABIT_LABELS_ZH",
+    "OPPONENT_HABITS_FORMAT",
+    "OPPONENT_HABITS_FORMAT_VERSION",
     "POSITION_ORDER",
     "PRODUCT_NOTICE",
     "action_timeline_html",
@@ -1798,6 +2140,7 @@ __all__ = [
     "format_metric",
     "format_percentage",
     "full_position_name",
+    "habit_level_label",
     "hand_public_view",
     "hero_net_result",
     "legal_action_controls",
@@ -1807,6 +2150,8 @@ __all__ = [
     "main",
     "metric_detail_rows",
     "normalize_reviews",
+    "opponent_habits_from_json",
+    "opponent_habits_to_json",
     "replay_reviews_through_sequence",
     "rebuild_replay",
     "review_cards_html",

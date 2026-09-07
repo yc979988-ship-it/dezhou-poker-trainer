@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import pytest
+
 from poker_trainer.analytics.database import SQLiteStore
 from poker_trainer.coaching.coach import DecisionReview
 from poker_trainer.engine.models import PREFLOP_ORDER, ActionType, Position
 from poker_trainer.engine.replay import ReplayBundle
+from poker_trainer.opponents.profiles import OpponentHabits, profile_from_habits
 from poker_trainer.training.adaptive import (
     AdaptiveScheduler,
     ScenarioPlan,
@@ -33,6 +36,132 @@ def test_session_config_uses_mvp_stakes_and_display_conversion() -> None:
     assert config.chips_to_yuan(100) == 1
     assert config.buy_in_yuan == 40
     assert config.auto_top_up is True
+
+
+def test_custom_friends_change_bots_without_persisting_identity() -> None:
+    friends = (
+        OpponentHabits(
+            "friend-xiao-wang",
+            "小王",
+            entry_frequency=5,
+            limp_frequency=5,
+            calling_tendency=5,
+        ),
+        OpponentHabits(
+            "friend-lao-li",
+            "老李",
+            preflop_aggression=5,
+            postflop_aggression=5,
+        ),
+    )
+    store = SQLiteStore(":memory:")
+    session = TrainingSession(
+        SessionConfig(seed=20260907, coach_trials=5, opponent_habits=friends),
+        store=store,
+    )
+    hand = session.start_hand()
+
+    assert len(hand.players) == 6
+    assert hand.player("bot-1").name == "对手1"
+    assert hand.player("bot-2").name == "对手2"
+    assert session.opponent_display_names["bot-1"] == "小王"
+    assert session.opponent_display_names["bot-2"] == "老李"
+    assert set(session.player_stacks) == {
+        "hero",
+        "bot-1",
+        "bot-2",
+        "bot-3",
+        "bot-4",
+        "bot-5",
+    }
+    expected = profile_from_habits(friends[0])
+    actual = session._bot_profiles["bot-1"]
+    assert actual.opponent_id == "bot-1"
+    assert abs(actual.vpip - expected.vpip) < 0.04
+
+    public_text = repr(session.public_state())
+    forbidden = (
+        "小王",
+        "老李",
+        "friend-xiao-wang",
+        "friend-lao-li",
+        "entry_frequency",
+        "limp_frequency",
+        "fold_tendency",
+    )
+    assert not any(term in public_text for term in forbidden)
+
+    _fold_hero_and_finish(session)
+    replay_text = ReplayBundle.from_hand(hand).to_json()
+    session.close()
+    database_text = "\n".join(store.connection.iterdump())
+    assert not any(term in replay_text for term in forbidden)
+    assert "vpip" not in replay_text and "pfr" not in replay_text
+    assert not any(term in database_text for term in forbidden)
+    stored_players = store.connection.execute(
+        "SELECT player_id, name FROM hand_players ORDER BY player_id"
+    ).fetchall()
+    assert {(row[0], row[1]) for row in stored_players} == {
+        ("hero", "你"),
+        ("bot-1", "对手1"),
+        ("bot-2", "对手2"),
+        ("bot-3", "对手3"),
+        ("bot-4", "对手4"),
+        ("bot-5", "对手5"),
+    }
+    store.close()
+
+
+def test_session_rejects_more_than_five_or_duplicate_custom_friends() -> None:
+    too_many = tuple(
+        OpponentHabits(f"friend-{index}", f"牌友{index}")
+        for index in range(6)
+    )
+    with pytest.raises(ValueError, match="最多"):
+        SessionConfig(opponent_habits=too_many)
+
+    repeated = OpponentHabits("same-id", "牌友")
+    with pytest.raises(ValueError, match="不能重复"):
+        SessionConfig(opponent_habits=(repeated, repeated))
+
+    same_name = (
+        OpponentHabits("friend-a", " 阿杰 "),
+        OpponentHabits("friend-b", "阿杰"),
+    )
+    with pytest.raises(ValueError, match="昵称不能重复"):
+        SessionConfig(opponent_habits=same_name)
+
+
+def test_same_seed_habits_and_hero_action_recreate_the_same_hand() -> None:
+    habits = (
+        OpponentHabits(
+            "friend-a",
+            "阿杰",
+            entry_frequency=5,
+            limp_frequency=4,
+            calling_tendency=5,
+        ),
+    )
+    config = SessionConfig(seed=20260907, coach_trials=25, opponent_habits=habits)
+    first = TrainingSession(config)
+    second = TrainingSession(config)
+
+    first_hand = first.start_hand()
+    second_hand = second.start_hand()
+    assert first_hand.hand_id != second_hand.hand_id
+    first.hero_action(ActionType.FOLD)
+    second.hero_action(ActionType.FOLD)
+
+    assert [row.as_dict() for row in first_hand.history] == [
+        row.as_dict() for row in second_hand.history
+    ]
+    assert tuple(map(str, first_hand.board)) == tuple(map(str, second_hand.board))
+    assert first_hand.result == second_hand.result
+    assert [row.as_dict() for row in first.last_hand_reviews] == [
+        row.as_dict() for row in second.last_hand_reviews
+    ]
+    first.close()
+    second.close()
 
 
 def test_teaching_returns_immediate_review_but_test_hides_it_until_complete() -> None:
@@ -215,4 +344,3 @@ def test_twentieth_hand_persists_profile_metrics_leaks_and_next_plan(tmp_path) -
 
     session.close()
     store.close()
-

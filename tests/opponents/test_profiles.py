@@ -7,9 +7,11 @@ from statistics import mean
 import pytest
 
 from poker_trainer.opponents.profiles import (
+    OpponentHabits,
     OpponentProfile,
     drift_for_session,
     generate_base_profile,
+    profile_from_habits,
 )
 
 
@@ -154,3 +156,63 @@ def test_profile_rejects_invalid_values(
 def test_seed_type_must_be_stably_encodable(bad_seed: object) -> None:
     with pytest.raises(TypeError, match="seed"):
         generate_base_profile("opponent-1", bad_seed)  # type: ignore[arg-type]
+
+
+def test_observed_habits_map_to_hidden_parameters_monotonically() -> None:
+    quiet = OpponentHabits(
+        "friend-1",
+        "小王",
+        entry_frequency=1,
+        limp_frequency=1,
+        preflop_aggression=1,
+        calling_tendency=1,
+        postflop_aggression=1,
+        mistake_frequency=1,
+    )
+    active = OpponentHabits(
+        "friend-2",
+        "老李",
+        entry_frequency=5,
+        limp_frequency=5,
+        preflop_aggression=5,
+        calling_tendency=5,
+        postflop_aggression=5,
+        mistake_frequency=5,
+    )
+
+    quiet_profile = profile_from_habits(quiet)
+    active_profile = profile_from_habits(active)
+
+    assert active_profile.vpip > quiet_profile.vpip
+    assert active_profile.pfr > quiet_profile.pfr
+    assert active_profile.three_bet > quiet_profile.three_bet
+    assert active_profile.limp_tendency > quiet_profile.limp_tendency
+    assert active_profile.aggression_factor > quiet_profile.aggression_factor
+    assert active_profile.mistake_rate > quiet_profile.mistake_rate
+    assert active_profile.fold_tendency < quiet_profile.fold_tendency
+    assert active_profile.pfr < active_profile.vpip
+
+
+def test_observed_habits_validate_levels_and_round_trip_mapping() -> None:
+    habits = OpponentHabits.from_mapping(
+        {
+            "opponent_id": " friend-7 ",
+            "nickname": " 阿七 ",
+            "entry_frequency": 4,
+            "limp_frequency": 3,
+            "preflop_aggression": 3,
+            "calling_tendency": 5,
+            "postflop_aggression": 3,
+            "mistake_frequency": 2,
+        }
+    )
+    assert habits.opponent_id == "friend-7"
+    assert habits.nickname == "阿七"
+    assert OpponentHabits.from_mapping(habits.as_dict()) == habits
+
+    with pytest.raises(ValueError, match="1 到 5"):
+        OpponentHabits("bad", "牌友", entry_frequency=0)
+    with pytest.raises(TypeError, match="整数"):
+        OpponentHabits("bad", "牌友", limp_frequency=2.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="nickname"):
+        OpponentHabits("bad", " ")

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from hashlib import blake2b
 from pathlib import Path
@@ -39,9 +39,11 @@ from poker_trainer.engine.models import (
 from poker_trainer.engine.replay import ReplayBundle
 from poker_trainer.opponents.policy import BotDecision, OpponentPolicy, PolicyContext
 from poker_trainer.opponents.profiles import (
+    OpponentHabits,
     OpponentProfile,
     drift_for_session,
     generate_base_profile,
+    profile_from_habits,
 )
 
 from .adaptive import (
@@ -96,6 +98,7 @@ class SessionConfig:
     hero_id: str = "hero"
     seed: int = 0
     coach_trials: int = 2_000
+    opponent_habits: tuple[OpponentHabits, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", TrainingMode.parse(self.mode))
@@ -122,6 +125,23 @@ class SessionConfig:
             raise TypeError("auto_top_up 必须是布尔值")
         if not isinstance(self.hero_id, str) or not self.hero_id.strip():
             raise ValueError("hero_id 不能为空")
+        try:
+            opponent_habits = tuple(self.opponent_habits)
+        except TypeError as exc:
+            raise TypeError("opponent_habits 必须是牌友习惯序列") from exc
+        if len(opponent_habits) > 5:
+            raise ValueError("一桌最多选择 5 名常用牌友")
+        if any(not isinstance(item, OpponentHabits) for item in opponent_habits):
+            raise TypeError("opponent_habits 只能包含 OpponentHabits")
+        opponent_ids = [item.opponent_id for item in opponent_habits]
+        if len(set(opponent_ids)) != len(opponent_ids):
+            raise ValueError("常用牌友 opponent_id 不能重复")
+        opponent_names = [item.nickname.casefold() for item in opponent_habits]
+        if len(set(opponent_names)) != len(opponent_names):
+            raise ValueError("常用牌友昵称不能重复")
+        if self.hero_id in opponent_ids:
+            raise ValueError("常用牌友 opponent_id 不能与 hero_id 相同")
+        object.__setattr__(self, "opponent_habits", opponent_habits)
 
     @property
     def buy_in_big_blinds(self) -> float:
@@ -194,6 +214,25 @@ class TrainingSession:
         )
 
         self._physical_player_ids = self._build_player_ids()
+        self._habit_by_player_id = dict(
+            zip(
+                self._physical_player_ids[1:],
+                self.config.opponent_habits,
+                strict=False,
+            )
+        )
+        # 昵称只作为当前进程中的 UI 显示覆盖层。引擎、回放和 SQLite 始终
+        # 使用 bot-N / 对手N，避免共享云端数据库意外保存用户录入的昵称。
+        self._opponent_display_names = {
+            player_id: (
+                self._habit_by_player_id[player_id].nickname
+                if player_id in self._habit_by_player_id
+                else f"对手{index}"
+            )
+            for index, player_id in enumerate(
+                self._physical_player_ids[1:], start=1
+            )
+        }
         self._player_names = {
             self.config.hero_id: "你",
             **{
@@ -207,9 +246,21 @@ class TrainingSession:
             player_id: self.config.buy_in for player_id in self._physical_player_ids
         }
         self._bot_profiles: dict[str, OpponentProfile] = {
-            player_id: drift_for_session(
-                generate_base_profile(player_id, self.config.seed),
-                _derived_seed(self.config.seed, "profile-drift"),
+            player_id: (
+                replace(
+                    drift_for_session(
+                        profile_from_habits(
+                            self._habit_by_player_id[player_id]
+                        ),
+                        _derived_seed(self.config.seed, "profile-drift"),
+                    ),
+                    opponent_id=player_id,
+                )
+                if player_id in self._habit_by_player_id
+                else drift_for_session(
+                    generate_base_profile(player_id, self.config.seed),
+                    _derived_seed(self.config.seed, "profile-drift"),
+                )
             )
             for player_id in self._physical_player_ids
             if player_id != self.config.hero_id
@@ -299,6 +350,12 @@ class TrainingSession:
     @property
     def player_stacks(self) -> Mapping[str, int]:
         return MappingProxyType(dict(self._stacks))
+
+    @property
+    def opponent_display_names(self) -> Mapping[str, str]:
+        """返回仅供当前 UI 使用的昵称覆盖；不会进入牌局快照或持久化。"""
+
+        return MappingProxyType(dict(self._opponent_display_names))
 
     @property
     def last_top_ups(self) -> Mapping[str, int]:
@@ -606,4 +663,3 @@ class TrainingSession:
 
 
 __all__ = ["SessionConfig", "TrainingMode", "TrainingSession"]
-

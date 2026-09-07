@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import blake2b
 import math
+from typing import Any, Mapping
 
 
 Seed = int | str | bytes
@@ -29,6 +30,102 @@ _MISTAKE_RATE_RANGE = (0.01, 0.07)
 _SESSION_LOGIT_SHIFT = 0.24
 _UNIT_DENOMINATOR = float(1 << 64)
 _LOGIT_EPSILON = 1e-12
+_HABIT_LEVEL_MIN = 1
+_HABIT_LEVEL_MAX = 5
+_HABIT_FIELDS = frozenset(
+    {
+        "opponent_id",
+        "nickname",
+        "entry_frequency",
+        "limp_frequency",
+        "preflop_aggression",
+        "calling_tendency",
+        "postflop_aggression",
+        "mistake_frequency",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class OpponentHabits:
+    """用户按实际观察录入的牌友习惯，不直接暴露内部概率参数。"""
+
+    opponent_id: str
+    nickname: str
+    entry_frequency: int = 3
+    limp_frequency: int = 3
+    preflop_aggression: int = 3
+    calling_tendency: int = 3
+    postflop_aggression: int = 3
+    mistake_frequency: int = 2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.opponent_id, str) or not self.opponent_id.strip():
+            raise ValueError("opponent_id 不能为空")
+        if not isinstance(self.nickname, str) or not self.nickname.strip():
+            raise ValueError("nickname 不能为空")
+        opponent_id = self.opponent_id.strip()
+        nickname = self.nickname.strip()
+        if len(opponent_id) > 128:
+            raise ValueError("opponent_id 最多 128 个字符")
+        if len(nickname) > 16:
+            raise ValueError("nickname 最多 16 个字符")
+        if any(ord(character) < 32 or ord(character) == 127 for character in nickname):
+            raise ValueError("nickname 不能包含换行或控制字符")
+        if any(ord(character) < 32 or ord(character) == 127 for character in opponent_id):
+            raise ValueError("opponent_id 不能包含换行或控制字符")
+        object.__setattr__(self, "opponent_id", opponent_id)
+        object.__setattr__(self, "nickname", nickname)
+        for field_name in (
+            "entry_frequency",
+            "limp_frequency",
+            "preflop_aggression",
+            "calling_tendency",
+            "postflop_aggression",
+            "mistake_frequency",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{field_name} 必须是 1 到 5 的整数")
+            if not _HABIT_LEVEL_MIN <= value <= _HABIT_LEVEL_MAX:
+                raise ValueError(f"{field_name} 必须在 1 到 5 之间")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "opponent_id": self.opponent_id,
+            "nickname": self.nickname,
+            "entry_frequency": self.entry_frequency,
+            "limp_frequency": self.limp_frequency,
+            "preflop_aggression": self.preflop_aggression,
+            "calling_tendency": self.calling_tendency,
+            "postflop_aggression": self.postflop_aggression,
+            "mistake_frequency": self.mistake_frequency,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "OpponentHabits":
+        if not isinstance(value, Mapping):
+            raise TypeError("牌友习惯必须是映射")
+        unknown_fields = set(value) - _HABIT_FIELDS
+        if unknown_fields:
+            raise ValueError(
+                "牌友习惯含未知字段：" + "、".join(sorted(map(str, unknown_fields)))
+            )
+        missing_fields = _HABIT_FIELDS - set(value)
+        if missing_fields:
+            raise ValueError(
+                "牌友习惯缺少字段：" + "、".join(sorted(missing_fields))
+            )
+        return cls(
+            opponent_id=value.get("opponent_id", ""),
+            nickname=value.get("nickname", ""),
+            entry_frequency=value.get("entry_frequency", 3),
+            limp_frequency=value.get("limp_frequency", 3),
+            preflop_aggression=value.get("preflop_aggression", 3),
+            calling_tendency=value.get("calling_tendency", 3),
+            postflop_aggression=value.get("postflop_aggression", 3),
+            mistake_frequency=value.get("mistake_frequency", 2),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +218,55 @@ def generate_base_profile(opponent_id: str, master_seed: Seed) -> OpponentProfil
         mistake_rate=_sample_range(
             _MISTAKE_RATE_RANGE,
             _stable_unit("base:mistake_rate", opponent_id, master_seed),
+        ),
+    )
+
+
+def profile_from_habits(habits: OpponentHabits) -> OpponentProfile:
+    """把六项可观察习惯稳定映射为连续隐藏参数。"""
+
+    if not isinstance(habits, OpponentHabits):
+        raise TypeError("habits 必须是 OpponentHabits")
+
+    def level_value(
+        level: int,
+        bounds: tuple[float, float],
+        *,
+        reverse: bool = False,
+    ) -> float:
+        # 用区间内 10%/30%/50%/70%/90% 分位，给会话漂移保留空间。
+        unit = (level - 0.5) / _HABIT_LEVEL_MAX
+        if reverse:
+            unit = 1.0 - unit
+        lower, upper = bounds
+        return lower + (upper - lower) * unit
+
+    vpip = level_value(habits.entry_frequency, _VPIP_RANGE)
+    pfr_share = level_value(habits.preflop_aggression, _PFR_SHARE_RANGE)
+    return OpponentProfile(
+        opponent_id=habits.opponent_id,
+        vpip=vpip,
+        pfr=vpip * pfr_share,
+        three_bet=level_value(
+            habits.preflop_aggression,
+            _THREE_BET_RANGE,
+        ),
+        aggression_factor=level_value(
+            habits.postflop_aggression,
+            _AGGRESSION_FACTOR_RANGE,
+        ),
+        fold_tendency=level_value(
+            habits.calling_tendency,
+            _FOLD_TENDENCY_RANGE,
+            reverse=True,
+        ),
+        limp_tendency=level_value(
+            habits.limp_frequency,
+            _LIMP_TENDENCY_RANGE,
+        ),
+        mistake_rate=level_value(
+            habits.mistake_frequency,
+            _MISTAKE_RATE_RANGE,
         ),
     )
 
@@ -258,7 +404,9 @@ def _bounded_logit_jitter(
 
 
 __all__ = [
+    "OpponentHabits",
     "OpponentProfile",
     "drift_for_session",
     "generate_base_profile",
+    "profile_from_habits",
 ]
