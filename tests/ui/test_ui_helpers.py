@@ -13,8 +13,19 @@ from poker_trainer.analytics.statistics import (
     PositionStatistics,
     aggregate_by_position,
 )
+from poker_trainer.engine.cards import parse_cards
+from poker_trainer.engine.evaluator import evaluate
 from poker_trainer.engine.hand import HoldemHand
-from poker_trainer.engine.models import ActionRecord, ActionType, LegalActions, Position, Street
+from poker_trainer.engine.models import (
+    ActionRecord,
+    ActionType,
+    HandResult,
+    LegalActions,
+    PlayerState,
+    Position,
+    Pot,
+    Street,
+)
 from poker_trainer.engine.replay import ReplayBundle
 from poker_trainer.ui.app import (
     POSITION_ORDER,
@@ -25,6 +36,7 @@ from poker_trainer.ui.app import (
     format_card,
     format_cards,
     format_chips,
+    format_hand_rank,
     format_metric,
     full_position_name,
     hand_public_view,
@@ -40,6 +52,7 @@ from poker_trainer.ui.app import (
     review_cards_html,
     result_pot_rows,
     seat_grid_html,
+    settlement_summary,
     showdown_rank_rows,
     statistics_table_rows,
 )
@@ -80,6 +93,129 @@ def _legal(**updates: object) -> LegalActions:
     return LegalActions(**values)  # type: ignore[arg-type]
 
 
+def _reported_showdown_hand() -> object:
+    """还原截图：SB 的 TT99Q 应击败英雄的 TT66Q。"""
+
+    board = tuple(parse_cards("Qd Ts 9d 6d 6h"))
+    players = {
+        "UTG": PlayerState(
+            "UTG",
+            "对手1",
+            Position.UTG,
+            stack=4_970,
+            starting_stack=4_000,
+            hole_cards=parse_cards("As 9h"),
+        ),
+        "SB": PlayerState(
+            "SB",
+            "对手5",
+            Position.SB,
+            stack=18_730,
+            starting_stack=18_170,
+            hole_cards=parse_cards("9c Tc"),
+            payout=1_120,
+        ),
+        "BB": PlayerState(
+            "BB",
+            "你",
+            Position.BB,
+            stack=3_640,
+            starting_stack=4_000,
+            hole_cards=parse_cards("Td 4s"),
+        ),
+    }
+    ranks = {
+        player_id: evaluate((*player.hole_cards, *board))
+        for player_id, player in players.items()
+    }
+    result = HandResult(
+        reason="showdown",
+        board=board,
+        pots=(
+            Pot(
+                amount=1_120,
+                cap=360,
+                contributors=("UTG", "SB", "BB"),
+                eligible=("UTG", "SB", "BB"),
+            ),
+        ),
+        payouts={"UTG": 0, "SB": 1_120, "BB": 0},
+        # 持久化结果只保存牌型名称；展示层需用公开牌面重建完整比较信息。
+        hand_ranks={player_id: rank.name_zh for player_id, rank in ranks.items()},
+    )
+    return type(
+        "ReportedShowdown",
+        (),
+        {"players": players, "board": list(board), "result": result},
+    )()
+
+
+def _split_pot_winners_hand() -> object:
+    """三人争主池、两人争边池，且两个池由不同玩家获胜。"""
+
+    board = tuple(parse_cards("2c 3d 7h 8s Kc"))
+    players = {
+        "UTG": PlayerState(
+            "UTG",
+            "短码玩家",
+            Position.UTG,
+            stack=900,
+            starting_stack=900,
+            hole_cards=parse_cards("Kh Kd"),
+            all_in=True,
+            payout=900,
+        ),
+        "SB": PlayerState(
+            "SB",
+            "中码玩家",
+            Position.SB,
+            stack=800,
+            starting_stack=1_700,
+            hole_cards=parse_cards("8c 8d"),
+            all_in=True,
+            payout=800,
+        ),
+        "BB": PlayerState(
+            "BB",
+            "你",
+            Position.BB,
+            stack=0,
+            starting_stack=1_700,
+            hole_cards=parse_cards("As Qs"),
+            all_in=True,
+        ),
+    }
+    ranks = {
+        player_id: evaluate((*player.hole_cards, *board))
+        for player_id, player in players.items()
+    }
+    result = HandResult(
+        reason="showdown",
+        board=board,
+        pots=(
+            Pot(
+                amount=900,
+                cap=300,
+                contributors=("UTG", "SB", "BB"),
+                eligible=("UTG", "SB", "BB"),
+            ),
+            Pot(
+                amount=800,
+                cap=700,
+                contributors=("SB", "BB"),
+                eligible=("SB", "BB"),
+            ),
+        ),
+        payouts={"UTG": 900, "SB": 800, "BB": 0},
+        hand_ranks={player_id: rank.name_zh for player_id, rank in ranks.items()},
+    )
+    return type(
+        "SplitPotWinners",
+        (),
+        {"players": players, "board": list(board), "result": result},
+    )()
+
+
 def test_ui_module_import_does_not_require_streamlit() -> None:
     sys.modules.pop("streamlit", None)
     module = importlib.reload(sys.modules["poker_trainer.ui.app"])
@@ -115,6 +251,19 @@ def test_chip_and_card_formatting_is_mobile_friendly() -> None:
     assert "&lt;" in cards_html(["<s"])
     with pytest.raises(ValueError):
         format_chips(100, chips_per_yuan=0)
+
+
+def test_hand_rank_formatting_explains_the_reported_two_pair_tiebreakers() -> None:
+    board = parse_cards("Qd Ts 9d 6d 6h")
+    sb_rank = evaluate((*parse_cards("9c Tc"), *board))
+    hero_rank = evaluate((*parse_cards("Td 4s"), *board))
+    utg_rank = evaluate((*parse_cards("As 9h"), *board))
+
+    assert sb_rank > hero_rank > utg_rank
+    assert format_hand_rank(sb_rank) == "两对 10 和 9（Q 踢脚）"
+    assert format_hand_rank(hero_rank) == "两对 10 和 6（Q 踢脚）"
+    assert format_hand_rank(utg_rank) == "两对 9 和 6（A 踢脚）"
+    assert "HandRank" not in format_hand_rank(sb_rank)
 
 
 def test_only_legal_action_buttons_are_built_and_call_shows_amount() -> None:
@@ -186,9 +335,69 @@ def test_public_hand_view_reveals_live_hands_only_after_showdown(six_seats) -> N
     ranks = showdown_rank_rows(hand)
     assert pots and pots[0]["底池"] == "主池"
     assert sum("筹码" in row["金额"] for row in pots) == len(pots)
+    assert all(row["赢家"] != "待确认" for row in pots)
     assert ranks and {row["玩家"].split(" · ")[0] for row in ranks} <= {
         full_position_name(position) for position in POSITION_ORDER
     }
+    assert ranks[0]["结果"] == "赢家"
+    assert all(row["最佳五张"] != "—" for row in ranks)
+    assert all("HandRank" not in row["牌型"] for row in ranks)
+
+
+def test_reported_showdown_rows_and_summary_name_the_actual_winner() -> None:
+    hand = _reported_showdown_hand()
+
+    pots = result_pot_rows(hand)
+    assert len(pots) == 1
+    assert pots[0]["底池"] == "主池"
+    assert pots[0]["金额"] == "1,120 筹码（¥11.20）"
+    assert "SB（小盲） · 对手5" in pots[0]["赢家"]
+    assert "BB（大盲）" not in pots[0]["赢家"]
+
+    rows = showdown_rank_rows(hand)
+    assert [row["玩家"].split(" · ")[0] for row in rows] == [
+        "SB（小盲）",
+        "BB（大盲）",
+        "UTG（前位）",
+    ]
+    assert rows[0]["结果"] == "赢家"
+    assert rows[0]["牌型"] == "两对 10 和 9（Q 踢脚）"
+    assert rows[0]["获得"] == "1,120 筹码（¥11.20）"
+    assert rows[1]["结果"] == "未获底池"
+    assert rows[1]["牌型"] == "两对 10 和 6（Q 踢脚）"
+    assert rows[2]["牌型"] == "两对 9 和 6（A 踢脚）"
+    assert all(row["最佳五张"] != "—" for row in rows)
+    assert all("HandRank" not in row["牌型"] for row in rows)
+
+    summary = settlement_summary(hand, "BB")
+    assert "赢家：SB（小盲） · 对手5" in summary
+    assert "两对 10 和 9（Q 踢脚）" in summary
+    assert "获得 1,120 筹码" in summary
+    assert "你的牌型是两对 10 和 6（Q 踢脚）" in summary
+    assert "本手未获得底池" in summary
+
+
+def test_main_and_side_pot_rows_name_each_winner_and_summary_lists_both() -> None:
+    hand = _split_pot_winners_hand()
+
+    pots = result_pot_rows(hand)
+    assert [(row["底池"], row["金额"]) for row in pots] == [
+        ("主池", "900 筹码（¥9.00）"),
+        ("边池 1", "800 筹码（¥8.00）"),
+    ]
+    assert "UTG（前位） · 短码玩家" in pots[0]["赢家"]
+    assert "SB（小盲）" not in pots[0]["赢家"]
+    assert "SB（小盲） · 中码玩家" in pots[1]["赢家"]
+    assert "UTG（前位）" not in pots[1]["赢家"]
+
+    summary = settlement_summary(hand, "BB")
+    assert "UTG（前位） · 短码玩家以三条 K" in summary
+    assert "获得 900 筹码" in summary
+    assert "SB（小盲） · 中码玩家以三条 8" in summary
+    assert "获得 800 筹码" in summary
+    assert summary.index("短码玩家") < summary.index("中码玩家")
+    assert "你的牌型是A 高牌" in summary
+    assert "本手未获得底池" in summary
 
 
 def test_history_rows_are_chinese_and_include_forced_blinds(six_seats) -> None:

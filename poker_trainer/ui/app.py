@@ -19,6 +19,7 @@ from poker_trainer.analytics.statistics import (
     METRIC_ORDER,
     MetricName,
 )
+from poker_trainer.engine.evaluator import HandCategory, HandRank, evaluate
 from poker_trainer.engine.models import ActionType, Position, Street
 from poker_trainer.engine.replay import ReplayBundle
 
@@ -121,6 +122,21 @@ def format_percentage(value: float | None, *, digits: int = 1) -> str:
 
 
 _SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
+_RANK_LABELS = {
+    14: "A",
+    13: "K",
+    12: "Q",
+    11: "J",
+    10: "10",
+    9: "9",
+    8: "8",
+    7: "7",
+    6: "6",
+    5: "5",
+    4: "4",
+    3: "3",
+    2: "2",
+}
 
 
 def format_card(card: Any) -> str:
@@ -148,6 +164,36 @@ def format_cards(
         return " ".join("🂠" for _ in range(max(0, hidden_count)))
     values = tuple(cards or ())
     return " ".join(format_card(card) for card in values) if values else empty
+
+
+def format_hand_rank(rank: Any) -> str:
+    """把完整牌型强度写成人能直接比较的中文，而非只显示“同为两对”。"""
+
+    if not isinstance(rank, HandRank):
+        return str(rank)
+    labels = tuple(_RANK_LABELS.get(value, str(value)) for value in rank.kickers)
+    category = rank.category
+    if category == HandCategory.HIGH_CARD:
+        return f"{labels[0]} 高牌（{'、'.join(labels[1:])}）"
+    if category == HandCategory.ONE_PAIR:
+        return f"一对 {labels[0]}（{'、'.join(labels[1:])} 踢脚）"
+    if category == HandCategory.TWO_PAIR:
+        return f"两对 {labels[0]} 和 {labels[1]}（{labels[2]} 踢脚）"
+    if category == HandCategory.THREE_OF_A_KIND:
+        return f"三条 {labels[0]}（{'、'.join(labels[1:])} 踢脚）"
+    if category == HandCategory.STRAIGHT:
+        return f"{labels[0]} 高顺子"
+    if category == HandCategory.FLUSH:
+        return f"{labels[0]} 高同花"
+    if category == HandCategory.FULL_HOUSE:
+        return f"葫芦 {labels[0]} 带 {labels[1]}"
+    if category == HandCategory.FOUR_OF_A_KIND:
+        return f"四条 {labels[0]}（{labels[1]} 踢脚）"
+    if category == HandCategory.STRAIGHT_FLUSH and rank.kickers == (14,):
+        return "皇家同花顺"
+    if category == HandCategory.STRAIGHT_FLUSH:
+        return f"{labels[0]} 高同花顺"
+    return rank.name_zh
 
 
 def cards_html(
@@ -322,33 +368,92 @@ def action_timeline_html(
     return "".join(parts)
 
 
+def _player_map(hand: Any) -> dict[str, Any]:
+    players_source = _read(hand, "players", {}) or {}
+    if isinstance(players_source, Mapping):
+        return {str(player_id): player for player_id, player in players_source.items()}
+    return {
+        str(_read(player, "player_id")): player
+        for player in players_source
+        if _read(player, "player_id") is not None
+    }
+
+
+def _player_label(players: Mapping[str, Any], player_id: str) -> str:
+    player = players.get(player_id)
+    if player is None:
+        return player_id
+    return (
+        f"{full_position_name(_read(player, 'position'))} · "
+        f"{_read(player, 'name', player_id)}"
+    )
+
+
+def _evaluated_showdown_ranks(hand: Any) -> dict[str, HandRank]:
+    """从已合法亮出的底牌重建完整牌力；引擎派奖本身仍是唯一结算来源。"""
+
+    result = _read(hand, "result")
+    if result is None or _read(result, "reason") != "showdown":
+        return {}
+    board = tuple(_read(result, "board", ()) or _read(hand, "board", ()) or ())
+    players = _player_map(hand)
+    saved_ranks = _read(result, "hand_ranks", {}) or {}
+    player_ids = tuple(str(player_id) for player_id in saved_ranks)
+    if not player_ids:
+        player_ids = tuple(
+            player_id
+            for player_id, player in players.items()
+            if not bool(_read(player, "folded", False))
+        )
+    ranks: dict[str, HandRank] = {}
+    for player_id in player_ids:
+        player = players.get(player_id)
+        hole_cards = tuple(_read(player, "hole_cards", ()) or ())
+        if len(hole_cards) != 2 or len(board) != 5:
+            continue
+        try:
+            ranks[player_id] = evaluate((*hole_cards, *board))
+        except (TypeError, ValueError):
+            continue
+    return ranks
+
+
 def result_pot_rows(hand: Any) -> list[dict[str, Any]]:
     """生成公开的主池/边池结算明细，不暴露任何隐藏画像。"""
 
     result = _read(hand, "result")
     if result is None:
         return []
-    players_source = _read(hand, "players", {}) or {}
-    players = (
-        players_source
-        if isinstance(players_source, Mapping)
-        else {_read(player, "player_id"): player for player in players_source}
-    )
-
-    def player_label(player_id: str) -> str:
-        player = players.get(player_id)
-        if player is None:
-            return player_id
-        return f"{full_position_name(_read(player, 'position'))} · {_read(player, 'name', player_id)}"
+    players = _player_map(hand)
+    ranks = _evaluated_showdown_ranks(hand)
 
     rows: list[dict[str, Any]] = []
     for index, pot in enumerate(tuple(_read(result, "pots", ()) or ())):
-        eligible = tuple(_read(pot, "eligible", ()) or ())
+        eligible = tuple(
+            str(player_id) for player_id in (_read(pot, "eligible", ()) or ())
+        )
+        eligible_ranks = {
+            player_id: ranks[player_id] for player_id in eligible if player_id in ranks
+        }
+        winners: tuple[str, ...] = ()
+        if eligible_ranks and len(eligible_ranks) == len(eligible):
+            best = max(eligible_ranks.values())
+            winners = tuple(
+                player_id for player_id in eligible if eligible_ranks[player_id] == best
+            )
+        elif len(eligible) == 1:
+            winners = eligible
         rows.append(
             {
                 "底池": "主池" if index == 0 else f"边池 {index}",
                 "金额": format_chips(int(_read(pot, "amount", 0) or 0)),
-                "可争夺玩家": "、".join(player_label(str(player_id)) for player_id in eligible),
+                "赢家": "、".join(
+                    _player_label(players, player_id) for player_id in winners
+                )
+                or "待确认",
+                "可争夺玩家": "、".join(
+                    _player_label(players, player_id) for player_id in eligible
+                ),
             }
         )
     return rows
@@ -360,29 +465,72 @@ def showdown_rank_rows(hand: Any) -> list[dict[str, Any]]:
     result = _read(hand, "result")
     if result is None or _read(result, "reason") != "showdown":
         return []
-    players_source = _read(hand, "players", {}) or {}
-    players = (
-        players_source
-        if isinstance(players_source, Mapping)
-        else {_read(player, "player_id"): player for player in players_source}
-    )
+    players = _player_map(hand)
     payouts = _read(result, "payouts", {}) or {}
+    evaluated = _evaluated_showdown_ranks(hand)
+    saved_ranks = _read(result, "hand_ranks", {}) or {}
+    player_ids = set(str(player_id) for player_id in saved_ranks) | set(evaluated)
+
+    def sort_key(player_id: str) -> tuple[int, tuple[int, ...]]:
+        rank = evaluated.get(player_id)
+        return (
+            int(int(payouts.get(player_id, 0) or 0) > 0),
+            rank.score if rank is not None else (),
+        )
+
     rows: list[dict[str, Any]] = []
-    for player_id, rank in (_read(result, "hand_ranks", {}) or {}).items():
-        player = players.get(player_id)
+    for player_id in sorted(player_ids, key=sort_key, reverse=True):
+        rank = evaluated.get(player_id)
+        fallback_rank = saved_ranks.get(player_id, "牌型未知")
         rows.append(
             {
-                "玩家": (
-                    f"{full_position_name(_read(player, 'position'))} · "
-                    f"{_read(player, 'name', player_id)}"
-                    if player is not None
-                    else str(player_id)
-                ),
-                "牌型": str(rank),
+                "结果": "赢家"
+                if int(payouts.get(player_id, 0) or 0) > 0
+                else "未获底池",
+                "玩家": _player_label(players, player_id),
+                "牌型": format_hand_rank(rank if rank is not None else fallback_rank),
+                "最佳五张": format_cards(rank.best_five) if rank is not None else "—",
                 "获得": format_chips(int(payouts.get(player_id, 0) or 0)),
             }
         )
     return rows
+
+
+def settlement_summary(hand: Any, hero_id: str) -> str:
+    """常显赢家、牌型与英雄牌型，避免把“英雄收回 0”误读为无人获奖。"""
+
+    result = _read(hand, "result")
+    if result is None:
+        return ""
+    players = _player_map(hand)
+    payouts = _read(result, "payouts", {}) or {}
+    ranks = _evaluated_showdown_ranks(hand)
+    winners = sorted(
+        (
+            (str(player_id), int(payout or 0))
+            for player_id, payout in payouts.items()
+            if int(payout or 0) > 0
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    winner_parts: list[str] = []
+    for player_id, payout in winners:
+        label = "你" if player_id == hero_id else _player_label(players, player_id)
+        rank = ranks.get(player_id)
+        hand_text = f"以{format_hand_rank(rank)}" if rank is not None else ""
+        winner_parts.append(f"{label}{hand_text}获得 {payout:,} 筹码")
+    if not winner_parts:
+        return "结算完成，但没有找到获奖记录。"
+
+    summary = f"赢家：{'；'.join(winner_parts)}。"
+    hero_rank = ranks.get(hero_id)
+    if hero_rank is not None and not any(player_id == hero_id for player_id, _ in winners):
+        summary += (
+            f"你的牌型是{format_hand_rank(hero_rank)}，"
+            f"最佳五张为 {format_cards(hero_rank.best_five)}，本手未获得底池。"
+        )
+    return summary
 
 
 def hand_public_view(
@@ -1233,7 +1381,6 @@ def _render_result(st: Any, trainer: Any, hand: Any) -> None:
     result = _read(hand, "result")
     if result is None:
         return
-    reason = _read(result, "reason", "")
     hero_id = str(_read(trainer, "hero_id", "hero"))
     payout = int((_read(result, "payouts", {}) or {}).get(hero_id, 0))
     net = hero_net_result(hand, hero_id)
@@ -1245,12 +1392,19 @@ def _render_result(st: Any, trainer: Any, hand: Any) -> None:
         st.warning(f"本手净结果 {net_text}")
     else:
         st.info(f"本手净结果 {net_text}")
-    ending = "摊牌结算" if reason == "showdown" else "未摊牌结束"
-    st.caption(f"{ending} · 结算返还/赢得 {format_chips(payout)}")
+    hero = _player_map(hand).get(hero_id)
+    invested = int(_read(hero, "total_commitment", 0) or 0)
+    st.caption(
+        f"你的结算：投入 {invested:,} 筹码 · 从底池获得 {payout:,} 筹码 · "
+        f"净结果 {net:+,}"
+    )
+    summary = settlement_summary(hand, hero_id)
+    if summary:
+        st.info(summary)
 
     pot_rows = result_pot_rows(hand)
     if pot_rows:
-        with st.expander("主池、边池与摊牌明细", expanded=len(pot_rows) > 1):
+        with st.expander("查看主池、赢家与最佳五张", expanded=len(pot_rows) > 1):
             st.dataframe(pot_rows, width="stretch", hide_index=True)
             rank_rows = showdown_rank_rows(hand)
             if rank_rows:
@@ -1559,6 +1713,9 @@ def _render_replay(st: Any) -> None:
             st.warning(f"本手净结果 {net_text}")
         else:
             st.info(f"本手净结果 {net_text}")
+        summary = settlement_summary(replayed, hero_id)
+        if summary:
+            st.info(summary)
         pot_rows = result_pot_rows(replayed)
         rank_rows = showdown_rank_rows(replayed)
         if pot_rows or rank_rows:
@@ -1637,6 +1794,7 @@ __all__ = [
     "format_card",
     "format_cards",
     "format_chips",
+    "format_hand_rank",
     "format_metric",
     "format_percentage",
     "full_position_name",
@@ -1655,5 +1813,6 @@ __all__ = [
     "result_pot_rows",
     "showdown_rank_rows",
     "seat_grid_html",
+    "settlement_summary",
     "statistics_table_rows",
 ]
