@@ -36,6 +36,7 @@ def test_eight_seat_hero_utg2_visible_with_real_stack_and_action_controls():
     trainer = SimpleNamespace(current_hand=hand, hero_id='UTG+2', mode='test',
                               opponent_display_names={}, advance_bots=lambda: None)
     page = AppTest.from_file(Path(__file__).resolve().parents[2] / 'app.py')
+    page.session_state['_browser_library_ready'] = True
     page.session_state['trainer'] = trainer
     page.session_state['nav'] = '训练'
     page.run()
@@ -58,4 +59,3 @@ def test_position_statistics_follow_table_size(size):
     positions = positions_for_table_size(size)
     rows = statistics_table_rows({}, positions=positions)
     assert [r['位置'] for r in rows] == [p.display_name for p in positions]
-
