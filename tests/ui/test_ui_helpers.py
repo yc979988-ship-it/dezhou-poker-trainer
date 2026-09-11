@@ -260,8 +260,8 @@ def _split_pot_winners_hand() -> object:
     )()
 
 
-def test_ui_module_import_does_not_require_streamlit() -> None:
-    sys.modules.pop("streamlit", None)
+def test_ui_module_import_does_not_require_streamlit(monkeypatch) -> None:
+    monkeypatch.delitem(sys.modules, "streamlit", raising=False)
     module = importlib.reload(sys.modules["poker_trainer.ui.app"])
     assert module.format_chips(4_000).startswith("4,000")
     assert "streamlit" not in sys.modules
