@@ -4,7 +4,7 @@ import pytest
 
 from poker_trainer.analytics.database import SQLiteStore
 from poker_trainer.coaching.coach import DecisionReview
-from poker_trainer.engine.models import PREFLOP_ORDER, ActionType, Position
+from poker_trainer.engine.models import PREFLOP_ORDER, ActionType, Position, positions_for_table_size
 from poker_trainer.engine.replay import ReplayBundle
 from poker_trainer.opponents.profiles import OpponentHabits, profile_from_habits
 from poker_trainer.training.adaptive import (
@@ -112,10 +112,10 @@ def test_custom_friends_change_bots_without_persisting_identity() -> None:
     store.close()
 
 
-def test_session_rejects_more_than_five_or_duplicate_custom_friends() -> None:
+def test_session_rejects_more_than_table_capacity_or_duplicate_custom_friends() -> None:
     too_many = tuple(
         OpponentHabits(f"friend-{index}", f"牌友{index}")
-        for index in range(6)
+        for index in range(8)
     )
     with pytest.raises(ValueError, match="最多"):
         SessionConfig(opponent_habits=too_many)
@@ -130,6 +130,17 @@ def test_session_rejects_more_than_five_or_duplicate_custom_friends() -> None:
     )
     with pytest.raises(ValueError, match="昵称不能重复"):
         SessionConfig(opponent_habits=same_name)
+
+
+@pytest.mark.parametrize("table_size", [5, 6, 7, 8])
+def test_session_supports_variable_table_sizes(table_size: int) -> None:
+    session = TrainingSession(SessionConfig(table_size=table_size, seed=100 + table_size, coach_trials=5))
+    hand = session.start_hand()
+    assert len(hand.players) == table_size
+    assert {player.position for player in hand.players.values()} == set(positions_for_table_size(table_size))
+    assert Position.SB in {player.position for player in hand.players.values()}
+    assert Position.BB in {player.position for player in hand.players.values()}
+    session.close()
 
 
 def test_same_seed_habits_and_hero_action_recreate_the_same_hand() -> None:
@@ -277,10 +288,10 @@ def test_six_physical_players_rotate_through_all_six_positions() -> None:
         ids = set(hand.players)
         physical_ids = ids if physical_ids is None else physical_ids
         assert ids == physical_ids
-        assert {player.position for player in hand.players.values()} == set(Position)
+        assert {player.position for player in hand.players.values()} == set(positions_for_table_size(6))
         _fold_hero_and_finish(session)
 
-    assert hero_positions == list(PREFLOP_ORDER)
+    assert hero_positions == list(positions_for_table_size(6))
     session.close()
 
 

@@ -1,4 +1,4 @@
-"""单手6人桌无限注德州的确定性状态机。"""
+"""2–8 人桌无限注德州的确定性状态机。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from .pots import build_pots
 
 
 ENGINE_VERSION = "0.1.0"
-RULES_VERSION = "nlhe-6max-v1"
+RULES_VERSION = "nlhe-2to8max-v2"
 
 
 class InvalidAction(ValueError):
@@ -55,8 +55,8 @@ class HoldemHand:
         deck_order: Iterable[Card | str] | None = None,
         scenario_id: str | None = None,
     ) -> None:
-        if not 2 <= len(seats) <= 6:
-            raise ValueError("牌桌人数必须为2至6人")
+        if not 2 <= len(seats) <= 8:
+            raise ValueError("牌桌人数必须为2至8人")
         if small_blind <= 0 or big_blind <= small_blind:
             raise ValueError("盲注必须满足 0 < SB < BB")
         if len({seat.player_id for seat in seats}) != len(seats):
@@ -725,4 +725,3 @@ class HoldemHand:
             "history": [record.as_dict() for record in self.history],
             "result": asdict(self.result) if self.result else None,
         }
-

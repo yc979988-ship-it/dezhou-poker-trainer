@@ -35,6 +35,7 @@ from poker_trainer.engine.models import (
     Position,
     Seat,
     Street,
+    positions_for_table_size,
 )
 from poker_trainer.engine.replay import ReplayBundle
 from poker_trainer.opponents.policy import BotDecision, OpponentPolicy, PolicyContext
@@ -87,8 +88,9 @@ class TrainingMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class SessionConfig:
-    """一场 6 人桌训练的稳定配置。"""
+    """一场 5–8 人桌训练的稳定配置。"""
 
+    table_size: int = 6
     mode: TrainingMode | str = TrainingMode.TEST
     small_blind: int = 20
     big_blind: int = 40
@@ -103,6 +105,7 @@ class SessionConfig:
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", TrainingMode.parse(self.mode))
         for field_name in (
+            "table_size",
             "small_blind",
             "big_blind",
             "buy_in",
@@ -121,6 +124,8 @@ class SessionConfig:
             raise ValueError("chips_per_yuan 必须大于 0")
         if self.coach_trials <= 0:
             raise ValueError("coach_trials 必须大于 0")
+        if self.table_size not in (5, 6, 7, 8):
+            raise ValueError("训练牌桌人数必须为 5、6、7 或 8 人")
         if not isinstance(self.auto_top_up, bool):
             raise TypeError("auto_top_up 必须是布尔值")
         if not isinstance(self.hero_id, str) or not self.hero_id.strip():
@@ -129,8 +134,8 @@ class SessionConfig:
             opponent_habits = tuple(self.opponent_habits)
         except TypeError as exc:
             raise TypeError("opponent_habits 必须是牌友习惯序列") from exc
-        if len(opponent_habits) > 5:
-            raise ValueError("一桌最多选择 5 名常用牌友")
+        if len(opponent_habits) > self.table_size - 1:
+            raise ValueError(f"{self.table_size}人桌最多选择 {self.table_size - 1} 名常用牌友")
         if any(not isinstance(item, OpponentHabits) for item in opponent_habits):
             raise TypeError("opponent_habits 只能包含 OpponentHabits")
         opponent_ids = [item.opponent_id for item in opponent_habits]
@@ -174,7 +179,7 @@ class TrainingSession:
     在牌局结束前返回 ``None``，结束时一次返回整手英雄复盘元组。
     """
 
-    _BOT_COUNT = 5
+    _MAX_BOT_COUNT = 7
     _MAX_BOT_ACTIONS_PER_ADVANCE = 1_000
 
     def __init__(
@@ -207,6 +212,7 @@ class TrainingSession:
             metadata={
                 "small_blind": self.config.small_blind,
                 "big_blind": self.config.big_blind,
+                "table_size": self.config.table_size,
                 "chips_per_yuan": self.config.chips_per_yuan,
                 "buy_in_yuan": self.config.buy_in_yuan,
                 "offline_only": True,
@@ -284,7 +290,7 @@ class TrainingSession:
     def _build_player_ids(self) -> tuple[str, ...]:
         ids = [self.config.hero_id]
         suffix = 1
-        while len(ids) <= self._BOT_COUNT:
+        while len(ids) < self.config.table_size:
             candidate = f"bot-{suffix}"
             suffix += 1
             if candidate not in ids:
@@ -415,8 +421,12 @@ class TrainingSession:
         self, hand_no: int, preferred_hero_position: Position | None
     ) -> dict[str, Position]:
         # PREFLOP_ORDER 让英雄前六手依次遍历 UTG/HJ/CO/BTN/SB/BB。
+        order = positions_for_table_size(self.config.table_size)
+        if preferred_hero_position is not None and preferred_hero_position not in order:
+            # 5 人桌没有 HJ，7/8 人桌的定向场景仍可复用 6max 位置。
+            preferred_hero_position = Position.UTG
         positions = {
-            player_id: PREFLOP_ORDER[(index + hand_no - 1) % len(PREFLOP_ORDER)]
+            player_id: order[(index + hand_no - 1) % len(order)]
             for index, player_id in enumerate(self._physical_player_ids)
         }
         if preferred_hero_position is not None:
@@ -425,14 +435,11 @@ class TrainingSession:
                 # 整桌统一旋转，而非把英雄与某名 bot 对调；这样六名物理
                 # 玩家在定向场景里仍保持原有相对座次。
                 shift = (
-                    PREFLOP_ORDER.index(preferred_hero_position)
-                    - PREFLOP_ORDER.index(current)
-                ) % len(PREFLOP_ORDER)
+                    order.index(preferred_hero_position)
+                    - order.index(current)
+                ) % len(order)
                 positions = {
-                    player_id: PREFLOP_ORDER[
-                        (PREFLOP_ORDER.index(position) + shift)
-                        % len(PREFLOP_ORDER)
-                    ]
+                    player_id: order[(order.index(position) + shift) % len(order)]
                     for player_id, position in positions.items()
                 }
         return positions
@@ -564,6 +571,8 @@ class TrainingSession:
         through_hand_no = self._completed_hand_count
         position_rows = self.position_statistics
         for position, row in position_rows.items():
+            if row.hands <= 0:
+                continue
             self._store.save_metric_snapshot(
                 self.session_id,
                 through_hand_no,

@@ -333,7 +333,8 @@ def _choose_preflop(
     policy_seed: int | str | bytes,
 ) -> BotDecision:
     strength = _preflop_strength(context.hole_cards)
-    position_score = strength + _POSITION_ADJUSTMENT[context.position]
+    # 多人桌新增的 UTG+1/UTG+2 沿用最前位的紧范围偏移。
+    position_score = strength + _POSITION_ADJUSTMENT.get(context.position, _POSITION_ADJUSTMENT[Position.UTG])
     selection_noise = (_uniform(policy_seed, context, "preflop-selection") - 0.5) * 0.12
     selection_score = position_score + selection_noise
 

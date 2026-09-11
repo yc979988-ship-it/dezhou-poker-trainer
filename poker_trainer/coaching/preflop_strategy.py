@@ -306,7 +306,11 @@ def _make_plan(
 
 
 def _unopened_plan(situation: PreflopSituation, hand: HandShape) -> PreflopPlan:
-    profile = _OPEN_PROFILES.get(situation.position)
+    # 7/8 人桌的 UTG+1/UTG+2 采用最前位的保守开池基准；
+    # 仍保留真实位置用于复盘文案。
+    profile = _OPEN_PROFILES.get(
+        Position.UTG if situation.position in {Position.UTG1, Position.UTG2} else situation.position
+    )
     in_range = profile is not None and _matches_profile(hand, profile)
     if in_range:
         fold_role = ActionRole.ERROR if _is_premium(hand) else ActionRole.DISCOURAGED
@@ -332,7 +336,7 @@ def _unopened_plan(situation: PreflopSituation, hand: HandShape) -> PreflopPlan:
 
     raise_role = (
         ActionRole.ERROR
-        if situation.position in {Position.UTG, Position.HJ} or hand.key == "96o"
+        if situation.position in {Position.UTG, Position.UTG1, Position.UTG2, Position.HJ} or hand.key == "96o"
         else ActionRole.DISCOURAGED
     )
     return _make_plan(

@@ -72,6 +72,7 @@ POSITION_ORDER: tuple[Position, ...] = (
     Position.SB,
     Position.BB,
 )
+TABLE_SIZE_OPTIONS = (5, 6, 7, 8)
 
 ACTION_LABELS: dict[ActionType, str] = {
     ActionType.FOLD: "弃牌",
@@ -1375,12 +1376,14 @@ def _create_training_session(
     auto_top_up: bool,
     db_path: Path,
     opponent_habits: Iterable[OpponentHabits] = (),
+    table_size: int = 6,
 ) -> Any:
     """延迟导入会话层，保持纯 helper 不依赖完整应用环境。"""
 
     from poker_trainer.training.session import SessionConfig, TrainingSession
 
     config = SessionConfig(
+        table_size=int(table_size),
         mode=mode,
         seed=int(seed),
         auto_top_up=bool(auto_top_up),
@@ -1388,7 +1391,9 @@ def _create_training_session(
         big_blind=40,
         buy_in=4000,
         chips_per_yuan=CHIPS_PER_YUAN,
-        opponent_habits=_normalise_opponent_habits(opponent_habits),
+        opponent_habits=_normalise_opponent_habits(
+            opponent_habits, limit=int(table_size) - 1
+        ),
     )
     trainer = TrainingSession(config=config, db_path=db_path)
     trainer.start_hand()
@@ -1404,8 +1409,8 @@ def _notice_html() -> str:
     )
 
 
-def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
-    """维护牌友库，并返回本局启用的最多5名牌友。"""
+def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHabits, ...]:
+    """维护牌友库，并返回本局启用的牌友。"""
 
     if st.session_state.pop("_reset_opponent_form_widgets", False):
         _clear_opponent_form_widgets(st)
@@ -1417,7 +1422,7 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
     if flash:
         st.success(str(flash))
     st.caption(
-        f"牌友库最多保存 {MAX_OPPONENT_ROSTER} 人；每局从库中选择最多 {MAX_ACTIVE_OPPONENTS} 人。"
+        f"牌友库最多保存 {MAX_OPPONENT_ROSTER} 人；本局最多启用 {max_active} 人。"
         "这里只记录观察到的起点，不是永久标签；每个训练场次仍会小幅变化。"
     )
     active_ids = set(st.session_state.get("active_opponent_ids", ()))
@@ -1431,9 +1436,9 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
             )
             if checked:
                 active_now.append(item)
-        if len(active_now) > MAX_ACTIVE_OPPONENTS:
-            st.warning(f"一桌最多启用 {MAX_ACTIVE_OPPONENTS} 名牌友，开始训练时只取前 {MAX_ACTIVE_OPPONENTS} 名。")
-        st.write("本局加入：" + ("、".join(item.nickname for item in active_now[:MAX_ACTIVE_OPPONENTS]) or "随机对手"))
+        if len(active_now) > max_active:
+            st.warning(f"本局最多启用 {max_active} 名牌友，开始训练时只取前 {max_active} 名。")
+        st.write("本局加入：" + ("、".join(item.nickname for item in active_now[:max_active]) or "随机对手"))
     else:
         st.caption("目前未录入，本桌将使用随机对手。")
 
@@ -1578,12 +1583,19 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
     st.session_state["active_opponent_ids"] = tuple(
         item.opponent_id for item in active_now[:MAX_ACTIVE_OPPONENTS]
     )
-    return tuple(active_now[:MAX_ACTIVE_OPPONENTS])
+    return tuple(active_now[:max_active])
 
 
 def _render_setup(st: Any) -> None:
     st.subheader("训练设置")
-    opponent_habits = _render_opponent_setup(st)
+    table_size = st.selectbox(
+        "牌桌人数",
+        TABLE_SIZE_OPTIONS,
+        index=1,
+        format_func=lambda n: f"{n}人桌",
+        help="朋友局可选 5–8 人；默认 6 人。",
+    )
+    opponent_habits = _render_opponent_setup(st, max_active=int(table_size) - 1)
     with st.form("session_settings"):
         mode_label = st.selectbox(
             "模式",
@@ -1602,7 +1614,7 @@ def _render_setup(st: Any) -> None:
             "每手结束后自动补回 100bb",
             value=True,
         )
-        st.caption("固定规格：6人桌 · 盲注 20/40 · 默认 4,000 筹码（100bb） · 100筹码=¥1")
+        st.caption(f"{table_size}人桌 · 盲注 20/40 · 默认 4,000 筹码（100bb） · 100筹码=¥1")
         submitted = st.form_submit_button("开始离线训练", type="primary", width="stretch")
 
     if submitted:
@@ -1618,6 +1630,7 @@ def _render_setup(st: Any) -> None:
                 mode=mode,
                 seed=int(seed),
                 auto_top_up=bool(auto_top_up),
+                table_size=int(table_size),
                 db_path=Path(st.session_state["db_path"]),
                 opponent_habits=opponent_habits,
             )
@@ -1631,7 +1644,7 @@ def _render_setup(st: Any) -> None:
         st.session_state["_next_nav"] = "训练"
         _rerun(st)
 
-    with st.expander("六个位置说明", expanded=False):
+    with st.expander("位置说明", expanded=False):
         for position in POSITION_ORDER:
             st.write(f"• {full_position_name(position)}")
     st.info("对手风格会在每个场次小幅漂移。界面只展示历史行动，不展示其隐藏参数或永久标签。")

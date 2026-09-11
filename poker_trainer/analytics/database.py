@@ -70,7 +70,7 @@ _MIGRATIONS: dict[int, str] = {
         hand_id TEXT NOT NULL REFERENCES hands(hand_id) ON DELETE CASCADE,
         player_id TEXT NOT NULL,
         name TEXT NOT NULL,
-        position TEXT NOT NULL CHECK (position IN ('UTG', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
+        position TEXT NOT NULL CHECK (position IN ('UTG', 'UTG+1', 'UTG+2', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
         starting_stack INTEGER NOT NULL CHECK (starting_stack >= 0),
         ending_stack INTEGER NOT NULL CHECK (ending_stack >= 0),
         total_commitment INTEGER NOT NULL CHECK (total_commitment >= 0),
@@ -87,7 +87,7 @@ _MIGRATIONS: dict[int, str] = {
         sequence INTEGER NOT NULL CHECK (sequence >= 0),
         street TEXT NOT NULL,
         player_id TEXT NOT NULL,
-        position TEXT NOT NULL CHECK (position IN ('UTG', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
+        position TEXT NOT NULL CHECK (position IN ('UTG', 'UTG+1', 'UTG+2', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
         action_type TEXT NOT NULL,
         requested_amount INTEGER,
         paid INTEGER NOT NULL,
@@ -133,7 +133,7 @@ _MIGRATIONS: dict[int, str] = {
         session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
         through_hand_no INTEGER NOT NULL CHECK (through_hand_no >= 0),
         sample_size INTEGER NOT NULL CHECK (sample_size >= 0),
-        position TEXT CHECK (position IS NULL OR position IN ('UTG', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
+        position TEXT CHECK (position IS NULL OR position IN ('UTG', 'UTG+1', 'UTG+2', 'HJ', 'CO', 'BTN', 'SB', 'BB')),
         metrics_json TEXT NOT NULL,
         created_at TEXT NOT NULL
     );
@@ -851,4 +851,3 @@ class SQLiteStore:
 
 
 __all__ = ["CURRENT_SCHEMA_VERSION", "SQLiteStore"]
-

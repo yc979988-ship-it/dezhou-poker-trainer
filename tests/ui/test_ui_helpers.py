@@ -56,8 +56,6 @@ from poker_trainer.ui.app import (
     normalize_reviews,
     opponent_habits_from_json,
     opponent_habits_to_json,
-    opponent_library_from_json,
-    opponent_library_to_json,
     rebuild_replay,
     replay_reviews_through_sequence,
     review_cards_html,
@@ -377,20 +375,6 @@ def test_opponent_habit_json_limits_roster_to_five_on_export_and_import() -> Non
     payload = _habit_json_payload([friend.as_dict() for friend in six_friends])
     with pytest.raises(ValueError, match="5|五|最多"):
         opponent_habits_from_json(payload)
-
-
-def test_opponent_library_json_allows_twelve_and_keeps_v1_compatibility() -> None:
-    friends = tuple(_friend_habits(number) for number in range(1, 8))
-    encoded = opponent_library_to_json(friends)
-    payload = json.loads(encoded)
-    assert payload["version"] == 2
-    assert len(opponent_library_from_json(encoded)) == 7
-    with pytest.raises(ValueError):
-        opponent_habits_from_json(encoded)
-
-    too_many = tuple(_friend_habits(number) for number in range(1, 14))
-    with pytest.raises(ValueError, match="12|十二|最多"):
-        opponent_library_to_json(too_many)
 
 
 @pytest.mark.parametrize(

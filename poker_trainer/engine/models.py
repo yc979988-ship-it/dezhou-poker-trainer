@@ -11,6 +11,8 @@ from .cards import Card
 
 class Position(str, Enum):
     UTG = "UTG"
+    UTG1 = "UTG+1"
+    UTG2 = "UTG+2"
     HJ = "HJ"
     CO = "CO"
     BTN = "BTN"
@@ -21,6 +23,8 @@ class Position(str, Enum):
     def label_zh(self) -> str:
         return {
             Position.UTG: "前位",
+            Position.UTG1: "前位1",
+            Position.UTG2: "前位2",
             Position.HJ: "中位",
             Position.CO: "后位，按钮前一位",
             Position.BTN: "按钮位，位置最好",
@@ -37,12 +41,16 @@ TABLE_ORDER = (
     Position.SB,
     Position.BB,
     Position.UTG,
+    Position.UTG1,
+    Position.UTG2,
     Position.HJ,
     Position.CO,
     Position.BTN,
 )
 PREFLOP_ORDER = (
     Position.UTG,
+    Position.UTG1,
+    Position.UTG2,
     Position.HJ,
     Position.CO,
     Position.BTN,
@@ -50,6 +58,21 @@ PREFLOP_ORDER = (
     Position.BB,
 )
 POSTFLOP_ORDER = TABLE_ORDER
+
+
+def positions_for_table_size(table_size: int) -> tuple[Position, ...]:
+    """返回 5–8 人桌的标准位置（翻前行动顺序）。"""
+
+    layouts = {
+        5: (Position.UTG, Position.CO, Position.BTN, Position.SB, Position.BB),
+        6: (Position.UTG, Position.HJ, Position.CO, Position.BTN, Position.SB, Position.BB),
+        7: (Position.UTG, Position.UTG1, Position.HJ, Position.CO, Position.BTN, Position.SB, Position.BB),
+        8: (Position.UTG, Position.UTG1, Position.UTG2, Position.HJ, Position.CO, Position.BTN, Position.SB, Position.BB),
+    }
+    try:
+        return layouts[int(table_size)]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("牌桌人数必须为 5、6、7 或 8 人") from exc
 
 
 class Street(str, Enum):
@@ -245,5 +268,3 @@ class HandResult:
     pots: tuple[Pot, ...]
     payouts: dict[str, int]
     hand_ranks: dict[str, str]
-
-
