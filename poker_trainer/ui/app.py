@@ -40,6 +40,9 @@ DEFAULT_DB_PATH = Path(
 CHIPS_PER_YUAN = 100
 OPPONENT_HABITS_FORMAT = "poker-trainer-opponents"
 OPPONENT_HABITS_FORMAT_VERSION = 1
+OPPONENT_LIBRARY_FORMAT_VERSION = 2
+MAX_OPPONENT_ROSTER = 12
+MAX_ACTIVE_OPPONENTS = 5
 _MAX_OPPONENT_HABITS_JSON_BYTES = 64 * 1024
 
 HABIT_LABELS_ZH: dict[str, tuple[str, ...]] = {
@@ -166,13 +169,15 @@ def _habit_level_from_label(field_name: str, label: str) -> int:
 
 def _normalise_opponent_habits(
     habits: Iterable[OpponentHabits],
+    *,
+    limit: int = MAX_ACTIVE_OPPONENTS,
 ) -> tuple[OpponentHabits, ...]:
     try:
         values = tuple(habits)
     except TypeError as exc:
         raise TypeError("牌友档案必须是序列") from exc
-    if len(values) > 5:
-        raise ValueError("一桌最多录入 5 名常用牌友")
+    if len(values) > limit:
+        raise ValueError(f"最多保存 {limit} 名牌友")
     if any(not isinstance(item, OpponentHabits) for item in values):
         raise TypeError("牌友档案只能包含 OpponentHabits")
     ids = [item.opponent_id for item in values]
@@ -232,6 +237,54 @@ def opponent_habits_from_json(text: str) -> tuple[OpponentHabits, ...]:
     except (TypeError, ValueError) as exc:
         raise ValueError(f"牌友档案内容无效：{exc}") from exc
     return _normalise_opponent_habits(habits)
+
+
+def opponent_library_to_json(habits: Iterable[OpponentHabits]) -> str:
+    """导出可保存多名牌友的本地库；开局时再从库中选择最多5人。"""
+
+    values = _normalise_opponent_habits(habits, limit=MAX_OPPONENT_ROSTER)
+    return json.dumps(
+        {
+            "format": OPPONENT_HABITS_FORMAT,
+            "version": OPPONENT_LIBRARY_FORMAT_VERSION,
+            "opponents": [item.as_dict() for item in values],
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def opponent_library_from_json(text: str) -> tuple[OpponentHabits, ...]:
+    """读取牌友库，兼容原先最多5人的 v1 备份。"""
+
+    if not isinstance(text, str):
+        raise TypeError("牌友库 JSON 必须是文本")
+    if len(text.encode("utf-8")) > _MAX_OPPONENT_HABITS_JSON_BYTES:
+        raise ValueError("牌友库超过 64KB，无法导入")
+    text = text.removeprefix("\ufeff")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("牌友库不是有效 JSON") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"format", "version", "opponents"}:
+        raise ValueError("牌友库顶层字段不完整或含未知字段")
+    if payload.get("format") != OPPONENT_HABITS_FORMAT:
+        raise ValueError("不是德州训练器牌友库")
+    version = payload.get("version")
+    if type(version) is not int or version not in {OPPONENT_HABITS_FORMAT_VERSION, OPPONENT_LIBRARY_FORMAT_VERSION}:
+        raise ValueError("不支持的牌友库版本")
+    rows = payload.get("opponents")
+    if not isinstance(rows, list):
+        raise ValueError("牌友库缺少 opponents 列表")
+    try:
+        habits = tuple(OpponentHabits.from_mapping(row) for row in rows)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"牌友库内容无效：{exc}") from exc
+    return _normalise_opponent_habits(
+        habits,
+        limit=MAX_ACTIVE_OPPONENTS if version == OPPONENT_HABITS_FORMAT_VERSION else MAX_OPPONENT_ROSTER,
+    )
 
 
 _SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
@@ -1304,6 +1357,7 @@ def _clear_opponent_form_widgets(st: Any) -> None:
         "opponent_calling_tendency_",
         "opponent_postflop_aggression_",
         "opponent_mistake_frequency_",
+        "opponent_active_",
     )
     for key in tuple(st.session_state):
         if str(key).startswith(prefixes):
@@ -1351,7 +1405,7 @@ def _notice_html() -> str:
 
 
 def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
-    """录入当前网页会话使用的常用牌友，未满五人时随机补位。"""
+    """维护牌友库，并返回本局启用的最多5名牌友。"""
 
     if st.session_state.pop("_reset_opponent_form_widgets", False):
         _clear_opponent_form_widgets(st)
@@ -1363,17 +1417,29 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
     if flash:
         st.success(str(flash))
     st.caption(
-        "最多 5 人，只建议填昵称。这里记录的是你观察到的起点，不是永久标签；"
-        "每个训练场次仍会小幅变化。"
+        f"牌友库最多保存 {MAX_OPPONENT_ROSTER} 人；每局从库中选择最多 {MAX_ACTIVE_OPPONENTS} 人。"
+        "这里只记录观察到的起点，不是永久标签；每个训练场次仍会小幅变化。"
     )
+    active_ids = set(st.session_state.get("active_opponent_ids", ()))
+    active_now: list[OpponentHabits] = []
     if habits:
-        st.write("本桌加入：" + "、".join(item.nickname for item in habits))
+        for item in habits:
+            checked = st.checkbox(
+                f"本局使用：{item.nickname}",
+                value=item.opponent_id in active_ids,
+                key=f"opponent_active_{item.opponent_id}",
+            )
+            if checked:
+                active_now.append(item)
+        if len(active_now) > MAX_ACTIVE_OPPONENTS:
+            st.warning(f"一桌最多启用 {MAX_ACTIVE_OPPONENTS} 名牌友，开始训练时只取前 {MAX_ACTIVE_OPPONENTS} 名。")
+        st.write("本局加入：" + ("、".join(item.nickname for item in active_now[:MAX_ACTIVE_OPPONENTS]) or "随机对手"))
     else:
-        st.caption("目前未录入，本桌将使用 5 名随机对手。")
+        st.caption("目前未录入，本桌将使用随机对手。")
 
     if st.button(
         "＋ 新增一位牌友",
-        disabled=len(habits) >= 5,
+        disabled=len(habits) >= MAX_OPPONENT_ROSTER,
         width="stretch",
         key="add_opponent_habit",
     ):
@@ -1386,6 +1452,7 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
             nickname=f"牌友{number}",
         )
         st.session_state["opponent_habits"] = (*habits, new_habits)
+        st.session_state["active_opponent_ids"] = (*active_ids, new_habits.opponent_id)
         st.session_state["_open_opponent_id"] = new_habits.opponent_id
         _rerun(st)
 
@@ -1436,6 +1503,9 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
                 st.session_state["opponent_habits"] = tuple(
                     row for row in habits if row.opponent_id != item.opponent_id
                 )
+                st.session_state["active_opponent_ids"] = tuple(
+                    value for value in active_ids if value != item.opponent_id
+                )
                 st.session_state["_opponent_flash"] = f"已移除 {item.nickname}"
                 _rerun(st)
             if save_clicked:
@@ -1464,8 +1534,8 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
         )
         st.download_button(
             "下载牌友档案",
-            data=opponent_habits_to_json(habits),
-            file_name="德州训练器-牌友档案.json",
+            data=opponent_library_to_json(habits),
+            file_name="德州训练器-牌友库.json",
             mime="application/json",
             width="stretch",
         )
@@ -1492,17 +1562,23 @@ def _render_opponent_setup(st: Any) -> tuple[OpponentHabits, ...]:
                 if len(raw_bytes) > _MAX_OPPONENT_HABITS_JSON_BYTES:
                     raise ValueError("牌友档案超过 64KB，无法导入")
                 raw = raw_bytes.decode("utf-8-sig")
-                imported = opponent_habits_from_json(raw)
+                imported = opponent_library_from_json(raw)
             except (AttributeError, UnicodeDecodeError, TypeError, ValueError) as exc:
                 st.error(f"导入失败：{exc}")
             else:
                 st.session_state["opponent_habits"] = imported
+                st.session_state["active_opponent_ids"] = tuple(
+                    item.opponent_id for item in imported[:MAX_ACTIVE_OPPONENTS]
+                )
                 st.session_state["_reset_opponent_form_widgets"] = True
                 st.session_state["_opponent_flash"] = (
                     f"已导入 {len(imported)} 位牌友"
                 )
                 _rerun(st)
-    return habits
+    st.session_state["active_opponent_ids"] = tuple(
+        item.opponent_id for item in active_now[:MAX_ACTIVE_OPPONENTS]
+    )
+    return tuple(active_now[:MAX_ACTIVE_OPPONENTS])
 
 
 def _render_setup(st: Any) -> None:
@@ -2088,6 +2164,7 @@ def main() -> None:
     st.session_state.setdefault("trainer", None)
     st.session_state.setdefault("latest_reviews", ())
     st.session_state.setdefault("opponent_habits", ())
+    st.session_state.setdefault("active_opponent_ids", ())
     if "db_path" not in st.session_state:
         st.session_state["db_path"] = str(_new_web_session_db_path())
     st.session_state.setdefault("nav", "设置")
@@ -2127,6 +2204,9 @@ __all__ = [
     "HABIT_LABELS_ZH",
     "OPPONENT_HABITS_FORMAT",
     "OPPONENT_HABITS_FORMAT_VERSION",
+    "OPPONENT_LIBRARY_FORMAT_VERSION",
+    "MAX_OPPONENT_ROSTER",
+    "MAX_ACTIVE_OPPONENTS",
     "POSITION_ORDER",
     "PRODUCT_NOTICE",
     "action_timeline_html",
@@ -2152,6 +2232,8 @@ __all__ = [
     "normalize_reviews",
     "opponent_habits_from_json",
     "opponent_habits_to_json",
+    "opponent_library_from_json",
+    "opponent_library_to_json",
     "replay_reviews_through_sequence",
     "rebuild_replay",
     "review_cards_html",
