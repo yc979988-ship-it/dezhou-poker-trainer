@@ -25,7 +25,9 @@ from poker_trainer.analytics.statistics import (
     MetricName,
 )
 from poker_trainer.engine.evaluator import HandCategory, HandRank, evaluate
-from poker_trainer.engine.models import ActionType, Position, Street
+from poker_trainer.engine.models import (
+    PREFLOP_ORDER, ActionType, Position, Street, positions_for_table_size,
+)
 from poker_trainer.engine.replay import ReplayBundle
 from poker_trainer.opponents.profiles import OpponentHabits
 
@@ -756,23 +758,9 @@ def hand_public_view(
         indexed[Position(_value(_read(player, "position")))] = player
 
     seats: list[dict[str, Any]] = []
-    for position in POSITION_ORDER:
+    for position in PREFLOP_ORDER:
         player = indexed.get(position)
         if player is None:
-            seats.append(
-                {
-                    "position": position,
-                    "position_name": full_position_name(position),
-                    "player_id": "",
-                    "name": "空位",
-                    "stack": 0,
-                    "folded": True,
-                    "all_in": False,
-                    "is_hero": False,
-                    "cards": (),
-                    "cards_hidden": True,
-                }
-            )
             continue
         player_id = str(_read(player, "player_id"))
         folded = bool(_read(player, "folded", False))
@@ -841,8 +829,11 @@ def format_metric(name: MetricName | str, hits: int, opportunities: int) -> str:
     return f"{hits / opportunities * 100:.1f}%（{hits}/{opportunities}）"
 
 
-def statistics_table_rows(statistics: Mapping[Any, Any] | Iterable[Any] | None) -> list[dict[str, Any]]:
-    """生成固定六位置×13指标表，缺样本不硬算。"""
+def statistics_table_rows(
+    statistics: Mapping[Any, Any] | Iterable[Any] | None,
+    *, positions: Sequence[Position] | None = None,
+) -> list[dict[str, Any]]:
+    """生成实际牌桌位置的13指标表，兼容旧六人桌统计。"""
 
     source: dict[Position, Any] = {}
     if isinstance(statistics, Mapping):
@@ -860,7 +851,11 @@ def statistics_table_rows(statistics: Mapping[Any, Any] | Iterable[Any] | None) 
                 continue
 
     rows: list[dict[str, Any]] = []
-    for position in POSITION_ORDER:
+    order = positions if positions is not None else tuple(
+        p for p in PREFLOP_ORDER
+        if p in POSITION_ORDER or int(_read(source.get(p), "hands", 0) or 0) > 0
+    )
+    for position in order:
         item = source.get(position)
         row: dict[str, Any] = {
             "位置": full_position_name(position),
@@ -1692,7 +1687,7 @@ def _render_setup(st: Any) -> None:
         _rerun(st)
 
     with st.expander("位置说明", expanded=False):
-        for position in POSITION_ORDER:
+        for position in positions_for_table_size(int(table_size)):
             st.write(f"• {full_position_name(position)}")
     st.info("对手风格会在每个场次小幅漂移。界面只展示历史行动，不展示其隐藏参数或永久标签。")
 
@@ -1938,9 +1933,12 @@ def _render_training(st: Any) -> None:
     )
     mode_name = "教学模式" if _mode_key(trainer) in {"teaching", "teach", "教学", "教学模式"} else "测试模式"
     st.subheader(f"第 {view['hand_no']} 手 · {mode_name}")
-    st.caption(f"手牌 seed：{view['seed']} · 20/40 · 100bb")
-    hero_seat = next((seat for seat in view["seats"] if seat["is_hero"]), None)
-    hero_stack = int(hero_seat["stack"] if hero_seat else 0)
+    st.caption(f"{len(view['seats'])}人桌 · 手牌 seed：{view['seed']} · 20/40 · 100bb")
+    hero_player = _player_map(hand).get(hero_id)
+    if hero_player is None:
+        st.error("当前牌局缺少你的座位，请重新开始训练。")
+        return
+    hero_stack = int(_read(hero_player, "stack", 0))
     st.markdown(_summary_tiles_html(view, hero_stack), unsafe_allow_html=True)
     st.markdown(
         '<div class="board-zone">'
@@ -2035,13 +2033,14 @@ def _render_statistics(st: Any) -> None:
         st.info("开始训练后，这里会按位置累计 13 项指标。")
         return
     statistics = _statistics_mapping(trainer)
-    rows = statistics_table_rows(statistics)
+    order = positions_for_table_size(int(_read(_read(trainer, "config"), "table_size", 6)))
+    rows = statistics_table_rows(statistics, positions=order)
     st.subheader("按位置统计")
     st.caption("百分比均用累计分子/分母计算；零机会不硬算，显示「信号不足」。")
     st.dataframe(rows, width="stretch", hide_index=True)
 
-    selected = st.selectbox("查看单个位置", [full_position_name(p) for p in POSITION_ORDER])
-    position = POSITION_ORDER[[full_position_name(p) for p in POSITION_ORDER].index(selected)]
+    selected = st.selectbox("查看单个位置", [full_position_name(p) for p in order])
+    position = order[[full_position_name(p) for p in order].index(selected)]
     selected_row = None
     if isinstance(statistics, Mapping):
         selected_row = statistics.get(position, statistics.get(position.value))
