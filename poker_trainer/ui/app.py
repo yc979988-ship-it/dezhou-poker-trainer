@@ -1415,7 +1415,7 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
     if st.session_state.pop("_reset_opponent_form_widgets", False):
         _clear_opponent_form_widgets(st)
     habits = _normalise_opponent_habits(
-        st.session_state.get("opponent_habits", ())
+        st.session_state.get("opponent_habits", ()), limit=MAX_OPPONENT_ROSTER
     )
     flash = st.session_state.pop("_opponent_flash", None)
     st.markdown("#### 常用牌友（可选）")
@@ -1524,7 +1524,7 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
                         updated if row.opponent_id == item.opponent_id else row
                         for row in habits
                     )
-                    _normalise_opponent_habits(replaced)
+                    _normalise_opponent_habits(replaced, limit=MAX_OPPONENT_ROSTER)
                 except (TypeError, ValueError) as exc:
                     st.error(f"无法保存：{exc}")
                 else:
@@ -1573,7 +1573,7 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
             else:
                 st.session_state["opponent_habits"] = imported
                 st.session_state["active_opponent_ids"] = tuple(
-                    item.opponent_id for item in imported[:MAX_ACTIVE_OPPONENTS]
+                    item.opponent_id for item in imported[:max_active]
                 )
                 st.session_state["_reset_opponent_form_widgets"] = True
                 st.session_state["_opponent_flash"] = (
@@ -1581,7 +1581,7 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
                 )
                 _rerun(st)
     st.session_state["active_opponent_ids"] = tuple(
-        item.opponent_id for item in active_now[:MAX_ACTIVE_OPPONENTS]
+        item.opponent_id for item in active_now[:max_active]
     )
     return tuple(active_now[:max_active])
 
