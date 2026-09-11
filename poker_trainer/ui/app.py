@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+import zlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from html import escape
@@ -43,6 +46,7 @@ OPPONENT_HABITS_FORMAT_VERSION = 1
 OPPONENT_LIBRARY_FORMAT_VERSION = 2
 MAX_OPPONENT_ROSTER = 12
 MAX_ACTIVE_OPPONENTS = 5
+TRAINER_URL = "https://dezhou-poker-trainer.streamlit.app/"
 _MAX_OPPONENT_HABITS_JSON_BYTES = 64 * 1024
 
 HABIT_LABELS_ZH: dict[str, tuple[str, ...]] = {
@@ -1586,6 +1590,44 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
     return tuple(active_now[:max_active])
 
 
+def opponent_library_link(habits: Iterable[OpponentHabits]) -> str:
+    """把当前档案装入可跨设备恢复的链接，不存入公开代码库。"""
+    raw = opponent_library_to_json(habits).encode("utf-8")
+    token = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+    return f"{TRAINER_URL}?friends={token}"
+
+
+def opponent_library_from_token(token: str) -> tuple[OpponentHabits, ...]:
+    """有限解压并复用严格的档案格式校验；链接内容一律视为不可信输入。"""
+    if not isinstance(token, str) or not token or len(token) > 12000:
+        raise ValueError("牌友链接无效或过长")
+    try:
+        packed = base64.b64decode(token + "=" * (-len(token) % 4), altchars=b"-_", validate=True)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(packed, _MAX_OPPONENT_HABITS_JSON_BYTES + 1)
+        if len(raw) > _MAX_OPPONENT_HABITS_JSON_BYTES or not decoder.eof or decoder.unused_data:
+            raise ValueError("牌友链接数据不完整或过大")
+        return opponent_library_from_json(raw.decode("utf-8"))
+    except (binascii.Error, zlib.error, UnicodeError) as exc:
+        raise ValueError("无法读取牌友链接") from exc
+
+
+def _restore_linked_library(st: Any) -> None:
+    token = st.query_params.get("friends", "")
+    if not token or token == st.session_state.get("_loaded_friends_token"):
+        return
+    try:
+        habits = opponent_library_from_token(token)
+    except (TypeError, ValueError) as exc:
+        st.warning(f"牌友链接无法恢复：{exc}。已有档案未改动。")
+        return
+    st.session_state["opponent_habits"] = habits
+    st.session_state["active_opponent_ids"] = tuple(x.opponent_id for x in habits[:5])
+    st.session_state["_loaded_friends_token"] = token
+    st.session_state["_reset_opponent_form_widgets"] = True
+    st.session_state["_opponent_flash"] = f"已从专用链接恢复 {len(habits)} 位牌友及习惯"
+
+
 def _render_setup(st: Any) -> None:
     st.subheader("训练设置")
     table_size = st.selectbox(
@@ -1596,6 +1638,11 @@ def _render_setup(st: Any) -> None:
         help="朋友局可选 5–8 人；默认 6 人。",
     )
     opponent_habits = _render_opponent_setup(st, max_active=int(table_size) - 1)
+    roster = st.session_state.get("opponent_habits", ())
+    if roster:
+        link = opponent_library_link(roster)
+        st.link_button("手机继续使用这份牌友库", link, width="stretch")
+        st.caption("链接包含当前昵称和习惯，请自行收藏。另一台设备打开即恢复；修改习惯后请使用新生成的链接，旧链接不会自动更新。")
     with st.form("session_settings"):
         mode_label = st.selectbox(
             "模式",
@@ -2178,6 +2225,7 @@ def main() -> None:
     st.session_state.setdefault("latest_reviews", ())
     st.session_state.setdefault("opponent_habits", ())
     st.session_state.setdefault("active_opponent_ids", ())
+    _restore_linked_library(st)
     if "db_path" not in st.session_state:
         st.session_state["db_path"] = str(_new_web_session_db_path())
     st.session_state.setdefault("nav", "设置")
@@ -2256,3 +2304,4 @@ __all__ = [
     "settlement_summary",
     "statistics_table_rows",
 ]
+
