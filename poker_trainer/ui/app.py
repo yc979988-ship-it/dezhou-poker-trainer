@@ -1533,8 +1533,8 @@ def _render_opponent_setup(st: Any, *, max_active: int = 5) -> tuple[OpponentHab
 
     with st.expander("备份或恢复牌友档案", expanded=False):
         st.caption(
-            "档案默认只留在当前打开的网页会话；云端重启或刷新可能清空。"
-            "下载 JSON 后可随时恢复。"
+            "档案自动保存在本机浏览器，刷新、重新打开或云端重启后会恢复。"
+            "换设备、无痕模式或清理浏览器数据后，请用备份链接或 JSON 恢复。"
         )
         st.download_button(
             "下载牌友档案",
@@ -1619,6 +1619,7 @@ def _restore_linked_library(st: Any) -> None:
     st.session_state["opponent_habits"] = habits
     st.session_state["active_opponent_ids"] = tuple(x.opponent_id for x in habits[:5])
     st.session_state["_loaded_friends_token"] = token
+    st.session_state["_browser_library_source"] = token
     st.session_state["_reset_opponent_form_widgets"] = True
     st.session_state["_opponent_flash"] = f"已从专用链接恢复 {len(habits)} 位牌友及习惯"
 
@@ -2225,6 +2226,20 @@ def main() -> None:
     st.session_state.setdefault("opponent_habits", ())
     st.session_state.setdefault("active_opponent_ids", ())
     _restore_linked_library(st)
+    from .library_storage import sync_browser_library
+
+    storage_slot = st.empty()
+    if not st.session_state.get("_browser_library_ready", False):
+        with storage_slot.container():
+            sync_browser_library(st)
+        st.caption("正在读取本机牌友库，请稍候。若浏览器一直没有响应，可暂用会话模式。")
+        if st.button("暂不读取本机存档，继续使用"):
+            st.session_state["_browser_library_ready"] = True
+            st.session_state["_browser_library_disabled"] = True
+            st.rerun()
+        st.stop()
+    if st.session_state.get("_browser_library_error"):
+        st.warning(st.session_state["_browser_library_error"])
     if "db_path" not in st.session_state:
         st.session_state["db_path"] = str(_new_web_session_db_path())
     st.session_state.setdefault("nav", "设置")
@@ -2252,6 +2267,8 @@ def main() -> None:
 
     st.divider()
     st.caption(PRODUCT_NOTICE)
+    with storage_slot.container():
+        sync_browser_library(st)
 
 
 __all__ = [
@@ -2303,4 +2320,3 @@ __all__ = [
     "settlement_summary",
     "statistics_table_rows",
 ]
-
